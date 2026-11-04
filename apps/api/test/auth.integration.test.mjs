@@ -198,7 +198,8 @@ test('registration, authentication and session lifecycle', async (t) => {
     assert.equal(response.headers.get('cache-control'), 'no-store');
     cookie = sessionCookie(response);
     const { user } = await response.json();
-    assert.deepEqual(Object.keys(user).sort(), ['createdAt', 'email', 'id', 'name']);
+    assert.deepEqual(Object.keys(user).sort(), ['createdAt', 'email', 'id', 'name', 'role']);
+    assert.equal(user.role, 'USER');
     assert.equal(user.email, email);
     assert.equal(user.name, '测试账号');
     userId = user.id;
@@ -301,19 +302,6 @@ test('registration, authentication and session lifecycle', async (t) => {
     assert.equal(oversized.status, 413);
   });
 
-  await t.test('repeated login attempts are rate limited', async () => {
-    let limited = false;
-    for (let attempt = 0; attempt < 12; attempt++) {
-      const response = await post('login', { email, password: 'A wrong password for rate limits' });
-      if (response.status === 429) {
-        limited = true;
-        break;
-      }
-      assert.equal(response.status, 401);
-    }
-    assert.equal(limited, true);
-  });
-
   await t.test('production uses a Secure HttpOnly cookie with the __Host prefix', () => {
     const output = execFileSync(
       process.execPath,
@@ -361,4 +349,317 @@ test('registration, authentication and session lifecycle', async (t) => {
       (error) => error.status === 1 && error.stderr.toString().includes('use HTTPS in production'),
     );
   });
+});
+
+test('administrator user management', async (t) => {
+  const { createToken } = require('../.test-dist/auth/session.js');
+  const original = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  const administrator = await prisma.user.create({
+    data: {
+      name: '管理员',
+      email: `admin-${randomUUID()}@example.com`,
+      role: 'ADMIN',
+      passwordHash: original.passwordHash,
+    },
+  });
+
+  async function fixtureCookie(id) {
+    const token = createToken();
+    const value = `demo_session=${token}`;
+    await prisma.session.create({
+      data: { userId: id, tokenHash: tokenHash(value), expiresAt: new Date(Date.now() + 60_000) },
+    });
+    return value;
+  }
+  const adminCookie = await fixtureCookie(administrator.id);
+  const ordinaryCookie = await fixtureCookie(userId);
+  let managed;
+  const managedEmail = `managed-${randomUUID()}@example.com`;
+
+  async function users(
+    path = '',
+    method = 'GET',
+    input,
+    currentCookie = adminCookie,
+    requestOrigin = origin,
+  ) {
+    return fetch(`${baseUrl}/api/users${path}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(currentCookie ? { Cookie: currentCookie } : {}),
+        ...(requestOrigin ? { Origin: requestOrigin } : {}),
+      },
+      ...(input ? { body: JSON.stringify(input) } : {}),
+    });
+  }
+  function updateInput(user, changes = {}) {
+    return {
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      status: user.status,
+      updatedAt: new Date(user.updatedAt).toISOString(),
+      ...changes,
+    };
+  }
+
+  await t.test(
+    'anonymous and ordinary accounts cannot list, read, create or update users',
+    async () => {
+      assert.equal((await users('', 'GET', undefined, null)).status, 401);
+      for (const [path, method, input] of [
+        ['', 'GET'],
+        [`/${userId}`, 'GET'],
+        ['', 'POST', { name: '越权', email: managedEmail, password }],
+        [`/${userId}`, 'PATCH', updateInput(original, { role: 'ADMIN' })],
+      ]) {
+        assert.equal((await users(path, method, input, ordinaryCookie)).status, 403);
+      }
+      assert.equal(
+        (await post('register', { name: '越权注册', email: managedEmail, password, role: 'ADMIN' }))
+          .status,
+        400,
+      );
+      assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: userId } })).role, 'USER');
+    },
+  );
+
+  await t.test('query validation caps pagination and rejects invalid filters and IDs', async () => {
+    for (const query of [
+      '?page=0',
+      '?page=1.5',
+      '?pageSize=101',
+      '?pageSize=-1',
+      '?status=unknown',
+      '?search=' + 'a'.repeat(101),
+      '?unexpected=true',
+    ]) {
+      assert.equal((await users(query)).status, 400);
+    }
+    assert.equal((await users('/not-a-uuid')).status, 400);
+    assert.equal((await users(`/${randomUUID()}`)).status, 404);
+  });
+
+  await t.test(
+    'administrator creation hashes passwords and does not create a session',
+    async () => {
+      const initialSessions = await prisma.session.count();
+      const input = { name: ' 管理测试用户 ', email: ` ${managedEmail.toUpperCase()} `, password };
+      assert.equal((await users('', 'POST', input, adminCookie, null)).status, 403);
+      assert.equal((await users('', 'POST', { ...input, password: 'short' })).status, 400);
+      const response = await users('', 'POST', input);
+      assert.equal(response.status, 201);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      assert.equal(response.headers.get('set-cookie'), null);
+      managed = (await response.json()).user;
+      assert.deepEqual(Object.keys(managed).sort(), [
+        'createdAt',
+        'email',
+        'id',
+        'name',
+        'role',
+        'status',
+        'updatedAt',
+      ]);
+      assert.equal(managed.email, managedEmail);
+      assert.equal(managed.name, '管理测试用户');
+      assert.equal(managed.role, 'USER');
+      const stored = await prisma.user.findUniqueOrThrow({ where: { id: managed.id } });
+      assert.equal(await verify(stored.passwordHash, password), true);
+      assert.equal(await prisma.session.count(), initialSessions);
+      assert.equal((await users('', 'POST', input)).status, 409);
+    },
+  );
+
+  await t.test(
+    'listing searches case insensitively, filters status, paginates and excludes secrets',
+    async () => {
+      await prisma.user.createMany({
+        data: Array.from({ length: 12 }, (_, index) => ({
+          name: `分页测试 ${index}`,
+          email: `page-${index}-${randomUUID()}@example.com`,
+          passwordHash: original.passwordHash,
+          status: index === 11 ? 'DISABLED' : 'ACTIVE',
+        })),
+      });
+      const response = await users('?page=1&pageSize=10');
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      const first = await response.json();
+      const second = await (await users('?page=2&pageSize=10')).json();
+      assert.equal(first.items.length, 10);
+      assert.equal(
+        new Set([...first.items, ...second.items].map((user) => user.id)).size,
+        first.total,
+      );
+      assert.equal(first.stats.total, await prisma.user.count());
+      assert.equal(first.stats.active + first.stats.disabled, first.stats.total);
+      for (const user of first.items)
+        assert.deepEqual(Object.keys(user).sort(), Object.keys(managed).sort());
+      const match = await (
+        await users(`?search=${encodeURIComponent(managedEmail.toUpperCase())}`)
+      ).json();
+      assert.equal(match.total, 1);
+      assert.equal(match.items[0].id, managed.id);
+      const disabled = await (
+        await users('?status=DISABLED&search=' + encodeURIComponent('分页测试'))
+      ).json();
+      assert.equal(disabled.total, 1);
+      assert.equal(disabled.items[0].status, 'DISABLED');
+      const empty = await (await users('?page=100&search=no-such-user')).json();
+      assert.equal(empty.total, 0);
+      assert.equal(empty.page, 1);
+      assert.deepEqual(empty.items, []);
+      assert.equal((await (await users(`/${managed.id}`)).json()).user.id, managed.id);
+    },
+  );
+
+  await t.test('editing enforces origin, email uniqueness and optimistic concurrency', async () => {
+    assert.equal(
+      (
+        await users(
+          `/${managed.id}`,
+          'PATCH',
+          updateInput(managed),
+          adminCookie,
+          'https://untrusted.example',
+        )
+      ).status,
+      403,
+    );
+    assert.equal(
+      (await users(`/${managed.id}`, 'PATCH', updateInput(managed, { email: email.toUpperCase() })))
+        .status,
+      409,
+    );
+    assert.equal((await users(`/${randomUUID()}`, 'PATCH', updateInput(managed))).status, 404);
+    assert.equal(
+      (
+        await users(`/${managed.id}`, 'PATCH', {
+          ...updateInput(managed),
+          passwordHash: 'override',
+        })
+      ).status,
+      400,
+    );
+    const previous = managed;
+    const response = await users(
+      `/${managed.id}`,
+      'PATCH',
+      updateInput(managed, { name: '修改后用户' }),
+    );
+    assert.equal(response.status, 200);
+    managed = (await response.json()).user;
+    assert.equal(managed.name, '修改后用户');
+    assert.equal(
+      (await users(`/${managed.id}`, 'PATCH', updateInput(previous, { name: '过期覆盖' }))).status,
+      409,
+    );
+    assert.equal(
+      (await prisma.user.findUniqueOrThrow({ where: { id: managed.id } })).name,
+      '修改后用户',
+    );
+  });
+
+  await t.test('disabling revokes every session and enabling never restores them', async () => {
+    const one = await fixtureCookie(managed.id);
+    const two = await fixtureCookie(managed.id);
+    assert.equal((await me(one)).status, 200);
+    const disabled = await users(
+      `/${managed.id}`,
+      'PATCH',
+      updateInput(managed, { status: 'DISABLED' }),
+    );
+    assert.equal(disabled.status, 200);
+    managed = (await disabled.json()).user;
+    assert.equal(await prisma.session.count({ where: { userId: managed.id } }), 0);
+    assert.equal((await me(one)).status, 401);
+    assert.equal((await me(two)).status, 401);
+    assert.equal((await post('login', { email: managedEmail, password })).status, 401);
+    const enabled = await users(
+      `/${managed.id}`,
+      'PATCH',
+      updateInput(managed, { status: 'ACTIVE' }),
+    );
+    assert.equal(enabled.status, 200);
+    managed = (await enabled.json()).user;
+    assert.equal((await me(one)).status, 401);
+    assert.equal((await post('login', { email: managedEmail, password })).status, 200);
+  });
+
+  await t.test('self-disable and self-demotion are rejected', async () => {
+    assert.equal(
+      (
+        await users(
+          `/${administrator.id}`,
+          'PATCH',
+          updateInput(administrator, { status: 'DISABLED' }),
+        )
+      ).status,
+      409,
+    );
+    assert.equal(
+      (await users(`/${administrator.id}`, 'PATCH', updateInput(administrator, { role: 'USER' })))
+        .status,
+      409,
+    );
+    assert.equal((await users('', 'GET')).status, 200);
+  });
+
+  await t.test('role changes revoke sessions and new sessions use the new role', async () => {
+    const previous = await fixtureCookie(managed.id);
+    const promoted = await users(
+      `/${managed.id}`,
+      'PATCH',
+      updateInput(managed, { role: 'ADMIN' }),
+    );
+    assert.equal(promoted.status, 200);
+    managed = (await promoted.json()).user;
+    assert.equal((await me(previous)).status, 401);
+    const elevated = await fixtureCookie(managed.id);
+    assert.equal((await users('', 'GET', undefined, elevated)).status, 200);
+    const demoted = await users(`/${managed.id}`, 'PATCH', updateInput(managed, { role: 'USER' }));
+    assert.equal(demoted.status, 200);
+    managed = (await demoted.json()).user;
+    assert.equal((await users('', 'GET', undefined, elevated)).status, 401);
+    assert.equal((await users('', 'GET', undefined, await fixtureCookie(managed.id))).status, 403);
+  });
+
+  await t.test('concurrent administrators cannot remove all active administrators', async () => {
+    const other = await prisma.user.create({
+      data: {
+        name: '第二管理员',
+        email: `other-admin-${randomUUID()}@example.com`,
+        role: 'ADMIN',
+        passwordHash: original.passwordHash,
+      },
+    });
+    const otherCookie = await fixtureCookie(other.id);
+    const responses = await Promise.all([
+      users(`/${other.id}`, 'PATCH', updateInput(other, { role: 'USER' })),
+      users(
+        `/${administrator.id}`,
+        'PATCH',
+        updateInput(administrator, { role: 'USER' }),
+        otherCookie,
+      ),
+    ]);
+    assert.equal(responses.filter((response) => response.status === 200).length, 1);
+    assert.ok(responses.every((response) => [200, 401, 403, 409].includes(response.status)));
+    assert.equal(await prisma.user.count({ where: { role: 'ADMIN', status: 'ACTIVE' } }), 1);
+  });
+});
+
+test('repeated login attempts are rate limited', async () => {
+  let limited = false;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const response = await post('login', { email, password: 'A wrong password for rate limits' });
+    if (response.status === 429) {
+      limited = true;
+      break;
+    }
+    assert.equal(response.status, 401);
+  }
+  assert.equal(limited, true);
 });

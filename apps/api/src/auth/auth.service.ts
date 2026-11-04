@@ -1,9 +1,10 @@
 import { ConflictException, Injectable, OnModuleInit, UnauthorizedException } from '@nestjs/common';
-import { argon2id, hash, verify } from 'argon2';
+import { verify } from 'argon2';
 import { PrismaService } from '../database/prisma.service';
 import { Prisma } from '../generated/prisma/client';
 import { CredentialsDto, RegisterDto } from './auth.dto';
 import { PublicUser } from './auth.types';
+import { hashPassword } from './password';
 import { createToken, hashToken, SESSION_DURATION_MS } from './session';
 
 const publicUserSelect = {
@@ -11,14 +12,8 @@ const publicUserSelect = {
   email: true,
   name: true,
   createdAt: true,
+  role: true,
 } satisfies Prisma.UserSelect;
-
-const passwordOptions = {
-  type: argon2id,
-  memoryCost: 19_456,
-  timeCost: 2,
-  parallelism: 1,
-} as const;
 
 @Injectable()
 export class AuthService implements OnModuleInit {
@@ -28,14 +23,14 @@ export class AuthService implements OnModuleInit {
 
   async onModuleInit(): Promise<void> {
     // Unknown accounts still perform password verification.
-    this.dummyPasswordHash = await hash(createToken(), passwordOptions);
+    this.dummyPasswordHash = await hashPassword(createToken());
   }
 
   async register(
     input: RegisterDto,
     previousToken: string | undefined,
   ): Promise<{ user: PublicUser; token: string }> {
-    const passwordHash = await hash(input.password, passwordOptions);
+    const passwordHash = await hashPassword(input.password);
     try {
       return await this.prisma.$transaction(async (transaction) => {
         const user = await transaction.user.create({
@@ -69,7 +64,13 @@ export class AuthService implements OnModuleInit {
       this.createSession(transaction, user.id, previousToken),
     );
     return {
-      user: { id: user.id, email: user.email, name: user.name, createdAt: user.createdAt },
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        createdAt: user.createdAt,
+        role: user.role,
+      },
       token,
     };
   }
@@ -88,8 +89,8 @@ export class AuthService implements OnModuleInit {
     if (!session || session.expiresAt <= new Date() || session.user.status !== 'ACTIVE') {
       throw new UnauthorizedException('登录已失效，请重新登录');
     }
-    const { id, email, name, createdAt } = session.user;
-    return { id, email, name, createdAt };
+    const { id, email, name, createdAt, role } = session.user;
+    return { id, email, name, createdAt, role };
   }
 
   async logout(token: string | undefined): Promise<void> {

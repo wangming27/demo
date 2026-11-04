@@ -1,105 +1,156 @@
-import { useEffect, useRef, useState } from 'react';
-import { getHealth } from './api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { getCurrentUser, logout } from './api';
+import type { User } from './api';
+import AdminDashboard from './AdminDashboard';
 import AuthPanel from './AuthPanel';
+import Icon from './Icon';
 
-type ConnectionState =
-  | { status: 'idle' }
+type SessionState =
   | { status: 'loading' }
-  | { status: 'connected'; service: string; timestamp: string }
+  | { status: 'anonymous'; notice: string }
+  | { status: 'authenticated'; user: User }
   | { status: 'error'; message: string };
 
 export default function App() {
-  const [connection, setConnection] = useState<ConnectionState>({ status: 'idle' });
+  const [session, setSession] = useState<SessionState>({ status: 'loading' });
+  const [pending, setPending] = useState<'refresh' | 'logout' | null>(null);
+  const [error, setError] = useState('');
   const requestRef = useRef<AbortController | null>(null);
-
-  useEffect(() => () => requestRef.current?.abort(), []);
-
-  async function checkConnection() {
+  const sessionExpired = useCallback(() => {
     requestRef.current?.abort();
-    const controller = new AbortController();
-    requestRef.current = controller;
-    setConnection({ status: 'loading' });
+    setPending(null);
+    setSession({ status: 'anonymous', notice: '登录已失效，请重新登录。' });
+  }, []);
 
+  async function restoreSession(signal: AbortSignal) {
     try {
-      const health = await getHealth(controller.signal);
-      if (!controller.signal.aborted) {
-        setConnection({
-          status: 'connected',
-          service: health.service,
-          timestamp: health.timestamp,
-        });
+      const user = await getCurrentUser(signal);
+      if (!signal.aborted) {
+        setSession(user ? { status: 'authenticated', user } : { status: 'anonymous', notice: '' });
       }
     } catch (error: unknown) {
-      if (!controller.signal.aborted) {
-        setConnection({
+      if (!signal.aborted) {
+        setSession({
           status: 'error',
-          message: error instanceof Error ? error.message : '服务暂时不可用',
+          message: error instanceof Error ? error.message : '服务暂时不可用，请稍后重试',
         });
-      }
-    } finally {
-      if (requestRef.current === controller) {
-        requestRef.current = null;
       }
     }
   }
 
+  useEffect(() => {
+    const controller = new AbortController();
+    requestRef.current = controller;
+    void getCurrentUser(controller.signal)
+      .then((user) => {
+        if (!controller.signal.aborted) {
+          setSession(
+            user ? { status: 'authenticated', user } : { status: 'anonymous', notice: '' },
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          setSession({
+            status: 'error',
+            message: error instanceof Error ? error.message : '服务暂时不可用，请稍后重试',
+          });
+        }
+      });
+    return () => requestRef.current?.abort();
+  }, []);
+
+  function retry() {
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setSession({ status: 'loading' });
+    void restoreSession(controller.signal);
+  }
+
+  async function accountAction(action: 'refresh' | 'logout') {
+    if (pending) return;
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setPending(action);
+    setError('');
+    try {
+      if (action === 'logout') {
+        await logout(controller.signal);
+        if (!controller.signal.aborted) {
+          setSession({ status: 'anonymous', notice: '已安全退出登录。' });
+        }
+      } else {
+        const user = await getCurrentUser(controller.signal);
+        if (!controller.signal.aborted) {
+          setSession(
+            user
+              ? { status: 'authenticated', user }
+              : { status: 'anonymous', notice: '登录已失效，请重新登录。' },
+          );
+        }
+      }
+    } catch (error: unknown) {
+      if (!controller.signal.aborted) {
+        setError(error instanceof Error ? error.message : '操作失败，请稍后重试');
+      }
+    } finally {
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        setPending(null);
+      }
+    }
+  }
+
+  if (session.status === 'authenticated') {
+    return (
+      <AdminDashboard
+        user={session.user}
+        pending={pending}
+        error={error}
+        onRefresh={() => void accountAction('refresh')}
+        onLogout={() => void accountAction('logout')}
+        onSessionExpired={sessionExpired}
+        onUserChanged={(user) => setSession({ status: 'authenticated', user })}
+      />
+    );
+  }
+
+  if (session.status === 'anonymous') {
+    return (
+      <AuthPanel
+        notice={session.notice}
+        onAuthenticated={(user) => {
+          setError('');
+          setSession({ status: 'authenticated', user });
+        }}
+      />
+    );
+  }
+
   return (
-    <main className="page">
-      <header className="header">
-        <span className="wordmark">self-demo</span>
-        <span className="badge">开发环境</span>
-      </header>
-
-      <section className="intro">
-        <p className="eyebrow">MONOREPO STARTER</p>
-        <h1>从这里开始构建。</h1>
-        <p className="description">创建你的账号或登录，开始使用应用。</p>
-      </section>
-
-      <AuthPanel />
-
-      <section className="connection-card" aria-labelledby="connection-title">
-        <div className="card-heading">
-          <div>
-            <p className="eyebrow">API CONNECTION</p>
-            <h2 id="connection-title">服务连接</h2>
-          </div>
-          <code>GET /api/health</code>
-        </div>
-
-        <div className="connection-state" role="status" aria-live="polite">
-          {connection.status === 'idle' && <p>点击下方按钮，检查前端与服务端是否连通。</p>}
-          {connection.status === 'loading' && <p>正在连接服务端…</p>}
-          {connection.status === 'connected' && (
-            <>
-              <p className="success">连接成功</p>
-              <dl>
-                <div>
-                  <dt>服务</dt>
-                  <dd>{connection.service}</dd>
-                </div>
-                <div>
-                  <dt>响应时间</dt>
-                  <dd>{new Date(connection.timestamp).toLocaleString('zh-CN')}</dd>
-                </div>
-              </dl>
-            </>
-          )}
-          {connection.status === 'error' && (
-            <p className="error">{connection.message}，请确认服务端已启动后重试。</p>
-          )}
-        </div>
-
-        <button
-          type="button"
-          disabled={connection.status === 'loading'}
-          onClick={() => void checkConnection()}
-        >
-          {connection.status === 'loading' ? '连接中…' : '检查连接'}
-        </button>
-      </section>
-
-      <footer>Vite + React · NestJS</footer>
+    <main className="session-page">
+      <div className="session-card">
+        <span className="brand-symbol">
+          <Icon name="layers" />
+        </span>
+        <h1>Demo Console</h1>
+        {session.status === 'loading' ? (
+          <p className="muted" role="status">
+            <span className="spinner" /> 正在确认登录状态…
+          </p>
+        ) : (
+          <>
+            <p className="error" role="alert">
+              {session.message}
+            </p>
+            <button className="primary-button" onClick={retry}>
+              重新连接
+            </button>
+          </>
+        )}
+      </div>
     </main>
   );
 }

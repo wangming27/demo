@@ -9,6 +9,6 @@ import { AuthService } from './auth.service';
   imports: [DatabaseModule, ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 60 }])],
   controllers: [AuthController],
   providers: [AuthService, OriginGuard, SessionGuard, ThrottlerGuard],
-  exports: [AuthService, SessionGuard],
+  exports: [AuthService, SessionGuard, OriginGuard],
 })
 export class AuthModule {}

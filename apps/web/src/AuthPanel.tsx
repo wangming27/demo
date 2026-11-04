@@ -1,96 +1,45 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { getCurrentUser, login, logout, register } from './api';
+import { login, register } from './api';
 import type { User } from './api';
+import Icon from './Icon';
 
-type SessionState =
-  | { status: 'loading' }
-  | { status: 'anonymous' }
-  | { status: 'authenticated'; user: User }
-  | { status: 'error'; message: string };
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : '服务暂时不可用，请稍后重试';
+interface AuthPanelProps {
+  notice: string;
+  onAuthenticated: (user: User) => void;
 }
 
-export default function AuthPanel() {
-  const [session, setSession] = useState<SessionState>({ status: 'loading' });
+export default function AuthPanel({ notice, onAuthenticated }: AuthPanelProps) {
   const [mode, setMode] = useState<'login' | 'register'>('login');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
   const requestRef = useRef<AbortController | null>(null);
+  const isRegister = mode === 'register';
 
-  useEffect(() => {
-    const controller = new AbortController();
-    requestRef.current = controller;
-    void getCurrentUser(controller.signal)
-      .then((user) => {
-        if (!controller.signal.aborted) {
-          setSession(user ? { status: 'authenticated', user } : { status: 'anonymous' });
-        }
-      })
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) {
-          setSession({ status: 'error', message: messageOf(error) });
-        }
-      })
-      .finally(() => {
-        if (requestRef.current === controller) {
-          requestRef.current = null;
-        }
-      });
-    return () => requestRef.current?.abort();
-  }, []);
-
-  async function retrySession() {
-    const controller = new AbortController();
-    requestRef.current?.abort();
-    requestRef.current = controller;
-    setSession({ status: 'loading' });
-    try {
-      const user = await getCurrentUser(controller.signal);
-      if (!controller.signal.aborted) {
-        setSession(user ? { status: 'authenticated', user } : { status: 'anonymous' });
-      }
-    } catch (error: unknown) {
-      if (!controller.signal.aborted) {
-        setSession({ status: 'error', message: messageOf(error) });
-      }
-    } finally {
-      if (requestRef.current === controller) {
-        requestRef.current = null;
-      }
-    }
-  }
+  useEffect(() => () => requestRef.current?.abort(), []);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (pending) {
-      return;
-    }
+    if (pending) return;
     const controller = new AbortController();
-    requestRef.current?.abort();
     requestRef.current = controller;
     setPending(true);
     setError('');
-    setNotice('');
     try {
-      const user =
-        mode === 'register'
-          ? await register({ name, email, password }, controller.signal)
-          : await login({ email, password }, controller.signal);
+      const user = isRegister
+        ? await register({ name, email, password }, controller.signal)
+        : await login({ email, password }, controller.signal);
       if (!controller.signal.aborted) {
-        setSession({ status: 'authenticated', user });
         setPassword('');
-        setNotice(mode === 'register' ? '注册成功，你已登录。' : '登录成功。');
+        onAuthenticated(user);
       }
     } catch (error: unknown) {
       if (!controller.signal.aborted) {
-        setError(messageOf(error));
+        setError(error instanceof Error ? error.message : '服务暂时不可用，请稍后重试');
       }
     } finally {
       if (requestRef.current === controller) {
@@ -100,113 +49,99 @@ export default function AuthPanel() {
     }
   }
 
-  async function signOut() {
-    if (pending) {
-      return;
-    }
-    const controller = new AbortController();
-    requestRef.current = controller;
-    setPending(true);
+  function switchMode() {
+    setMode(isRegister ? 'login' : 'register');
+    setPassword('');
+    setShowPassword(false);
     setError('');
-    setNotice('');
-    try {
-      await logout(controller.signal);
-      if (!controller.signal.aborted) {
-        setSession({ status: 'anonymous' });
-        setPassword('');
-        setMode('login');
-        setNotice('已退出登录。');
-      }
-    } catch (error: unknown) {
-      if (!controller.signal.aborted) {
-        setError(messageOf(error));
-      }
-    } finally {
-      if (requestRef.current === controller) {
-        requestRef.current = null;
-        setPending(false);
-      }
-    }
   }
 
   return (
-    <section className="auth-card" aria-labelledby="auth-title" aria-busy={pending}>
-      <div className="card-heading">
-        <div>
-          <p className="eyebrow">YOUR ACCOUNT</p>
-          <h2 id="auth-title">我的账号</h2>
-        </div>
-        {session.status === 'authenticated' && <span className="badge">已登录</span>}
-      </div>
-
-      {session.status === 'loading' && <p role="status">正在确认登录状态…</p>}
-      {session.status === 'error' && (
-        <div className="session-error">
-          <p className="error" role="alert">
-            {session.message}
+    <main className="login-page">
+      <section className="login-story" aria-label="Demo Console">
+        <a className="brand" href="/">
+          <span className="brand-symbol">
+            <Icon name="layers" />
+          </span>
+          <span>
+            Demo<span className="brand-light"> Console</span>
+          </span>
+        </a>
+        <div className="story-content">
+          <span className="story-label">
+            <span className="status-dot" /> 你的管理工作台
+          </span>
+          <h1>
+            让管理更清晰，
+            <br />
+            让工作更简单。
+          </h1>
+          <p>
+            从一个井然有序的工作台开始，
+            <br />
+            集中查看用户信息，轻松掌握账号状态。
           </p>
-          <button type="button" onClick={() => void retrySession()}>
-            重试
-          </button>
-        </div>
-      )}
-      {session.status === 'authenticated' && (
-        <div className="account-details">
-          <p className="welcome">你好，{session.user.name}</p>
-          <dl>
-            <div>
-              <dt>邮箱</dt>
-              <dd>{session.user.email}</dd>
+          <div className="workspace-art" aria-hidden="true">
+            <div className="art-header">
+              <span />
+              <span />
+              <span />
             </div>
-            <div>
-              <dt>注册时间</dt>
-              <dd>{new Date(session.user.createdAt).toLocaleString('zh-CN')}</dd>
+            <div className="art-body">
+              <div className="art-sidebar">
+                <i />
+                <i />
+                <i />
+                <i />
+              </div>
+              <div className="art-main">
+                <div className="art-title" />
+                <div className="art-stats">
+                  <i />
+                  <i />
+                  <i />
+                </div>
+                <div className="art-row">
+                  <b />
+                  <i />
+                  <span />
+                </div>
+                <div className="art-row">
+                  <b />
+                  <i />
+                  <span />
+                </div>
+                <div className="art-row">
+                  <b />
+                  <i />
+                  <span />
+                </div>
+              </div>
             </div>
-          </dl>
-          <button type="button" disabled={pending} onClick={() => void signOut()}>
-            {pending ? '正在退出…' : '退出登录'}
-          </button>
-        </div>
-      )}
-      {session.status === 'anonymous' && (
-        <>
-          <div className="auth-modes" role="group" aria-label="选择登录或注册">
-            <button
-              type="button"
-              aria-pressed={mode === 'login'}
-              disabled={pending}
-              onClick={() => {
-                setMode('login');
-                setPassword('');
-                setError('');
-                setNotice('');
-              }}
-            >
-              登录
-            </button>
-            <button
-              type="button"
-              aria-pressed={mode === 'register'}
-              disabled={pending}
-              onClick={() => {
-                setMode('register');
-                setPassword('');
-                setError('');
-                setNotice('');
-              }}
-            >
-              注册
-            </button>
           </div>
-          <form className="auth-form" onSubmit={(event) => void submit(event)}>
+        </div>
+        <p className="story-footer">DEMO CONSOLE · 把每一次管理，变得简单</p>
+      </section>
+      <section className="login-main">
+        <span className="login-top-note">一个账号，一个有序的工作空间</span>
+        <div className="login-form-container">
+          <span className="form-icon">
+            <Icon name={isRegister ? 'users' : 'lock'} />
+          </span>
+          <h2>{isRegister ? '创建你的账号' : '欢迎回来'}</h2>
+          <p className="login-description">
+            {isRegister ? '填写以下信息，开启你的工作台。' : '登录你的账号，进入管理工作台。'}
+          </p>
+          <form className="auth-form" onSubmit={(event) => void submit(event)} aria-busy={pending}>
             <fieldset disabled={pending}>
-              {mode === 'register' && (
+              {isRegister && (
                 <label htmlFor="account-name">
                   昵称
                   <input
                     id="account-name"
                     name="name"
                     autoComplete="nickname"
+                    placeholder="怎么称呼你"
                     value={name}
                     onChange={(event) => setName(event.target.value)}
                     required
@@ -215,51 +150,91 @@ export default function AuthPanel() {
                 </label>
               )}
               <label htmlFor="account-email">
-                邮箱
-                <input
-                  id="account-email"
-                  name="email"
-                  type="email"
-                  autoComplete="username"
-                  value={email}
-                  onChange={(event) => setEmail(event.target.value)}
-                  required
-                  maxLength={254}
-                />
+                邮箱地址
+                <div className="input-with-icon">
+                  <Icon name="mail" />
+                  <input
+                    id="account-email"
+                    name="email"
+                    type="email"
+                    autoComplete="username"
+                    placeholder="you@example.com"
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    required
+                    maxLength={254}
+                  />
+                </div>
               </label>
               <label htmlFor="account-password">
                 密码
-                <input
-                  id="account-password"
-                  name="password"
-                  type="password"
-                  autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  required
-                  minLength={12}
-                  maxLength={128}
-                  aria-describedby="password-help"
-                />
+                <div className="input-with-icon">
+                  <Icon name="lock" />
+                  <input
+                    id="account-password"
+                    name="password"
+                    aria-label="密码"
+                    type={showPassword ? 'text' : 'password'}
+                    autoComplete={isRegister ? 'new-password' : 'current-password'}
+                    placeholder="请输入密码"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    required
+                    minLength={isRegister ? 12 : 1}
+                    maxLength={128}
+                    aria-describedby="password-help"
+                  />
+                  <button
+                    type="button"
+                    className="password-toggle"
+                    aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                    aria-pressed={showPassword}
+                    onClick={() => setShowPassword(!showPassword)}
+                  >
+                    <Icon name={showPassword ? 'eye-off' : 'eye'} />
+                  </button>
+                </div>
               </label>
               <p id="password-help" className="field-help">
-                密码需为 12–128 个字符。
+                {isRegister ? '密码长度为 12–128 个字符。' : '请输入你的账号密码。'}
               </p>
-              <button type="submit">
-                {pending ? '正在处理…' : mode === 'register' ? '注册并登录' : '登录'}
+              {error && (
+                <p className="error form-message" role="alert">
+                  {error}
+                </p>
+              )}
+              <button type="submit" className="primary-button login-submit">
+                {pending ? (
+                  <>
+                    <span className="spinner" /> 正在处理…
+                  </>
+                ) : (
+                  <>
+                    {isRegister ? '注册并进入工作台' : '登录工作台'}
+                    <Icon name="arrow-right" />
+                  </>
+                )}
               </button>
             </fieldset>
           </form>
-        </>
-      )}
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
-      <p className="auth-notice" role="status" aria-live="polite">
-        {notice}
-      </p>
-    </section>
+          <p className="signup-prompt">
+            {isRegister ? '已有账号？' : '还没有账号？'}
+            <button className="text-button" disabled={pending} onClick={switchMode}>
+              {isRegister ? '返回登录' : '立即注册'}
+            </button>
+          </p>
+          {notice && (
+            <p className="success form-message" role="status">
+              {notice}
+            </p>
+          )}
+          <div className="login-security">
+            <Icon name="shield" />
+            <span>安全登录，安心管理</span>
+          </div>
+        </div>
+        <footer className="login-footer">Demo Console · 用户管理工作台</footer>
+      </section>
+    </main>
   );
 }

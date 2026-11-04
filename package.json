@@ -18,6 +18,7 @@
     "db:migrate": "corepack pnpm --filter @repo/api db:migrate",
     "db:deploy": "corepack pnpm --filter @repo/api db:deploy",
     "db:studio": "corepack pnpm --filter @repo/api db:studio",
+    "users:admin": "corepack pnpm --filter @repo/api users:admin",
     "db:sessions:cleanup": "corepack pnpm --filter @repo/api db:sessions:cleanup",
     "test:integration": "corepack pnpm --filter @repo/api test:integration",
     "build": "turbo run build",
