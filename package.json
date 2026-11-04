@@ -1,0 +1,32 @@
+{
+  "name": "self-demo",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=22.12.0",
+    "pnpm": ">=10.20.0 <11"
+  },
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "eslint . --max-warnings 0 && turbo run lint",
+    "lint:fix": "eslint . --fix && turbo run lint:fix",
+    "typecheck": "turbo run typecheck",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "check": "prettier . --check && eslint . --max-warnings 0 && turbo run lint typecheck build",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "corepack pnpm check && changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.29.7",
+    "@repo/eslint-config": "workspace:*",
+    "@repo/prettier-config": "workspace:*",
+    "eslint": "^9.39.0",
+    "prettier": "^3.6.2",
+    "turbo": "^2.6.0",
+    "typescript": "~5.9.3"
+  }
+}

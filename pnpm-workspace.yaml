@@ -1,0 +1,11 @@
+packages:
+  - apps/*
+  - packages/*
+
+onlyBuiltDependencies:
+  - '@nestjs/core'
+  - esbuild
+
+overrides:
+  # Nest CLI pins an older webpack; schema-utils requires this newer release.
+  webpack: ^5.112.2
