@@ -6,26 +6,43 @@
     "packages/typescript-config/**"
   ],
   "tasks": {
+    "db:generate": {
+      "inputs": [
+        "prisma/schema.prisma",
+        "prisma.config.mjs",
+        "package.json",
+        "$TURBO_ROOT$/pnpm-lock.yaml"
+      ],
+      "outputs": ["src/generated/prisma/**"]
+    },
     "build": {
-      "dependsOn": ["^build", "typecheck"],
+      "dependsOn": ["^build", "typecheck", "db:generate"],
       "outputs": ["dist/**"],
       "env": ["VITE_*"]
     },
     "lint": {
-      "dependsOn": ["^lint"],
+      "dependsOn": ["^lint", "db:generate"],
       "outputs": []
     },
     "lint:fix": {
       "cache": false
     },
     "typecheck": {
-      "dependsOn": ["^typecheck"],
+      "dependsOn": ["^typecheck", "db:generate"],
       "outputs": []
     },
     "dev": {
       "cache": false,
       "persistent": true,
-      "passThroughEnv": ["PORT", "API_PROXY_TARGET", "VITE_*"]
+      "passThroughEnv": [
+        "PORT",
+        "API_PROXY_TARGET",
+        "VITE_*",
+        "NODE_ENV",
+        "DATABASE_URL",
+        "AUTH_ALLOWED_ORIGINS",
+        "TRUST_PROXY_HOPS"
+      ]
     }
   }
 }

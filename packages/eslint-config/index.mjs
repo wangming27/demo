@@ -6,7 +6,14 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 const ignores = {
-  ignores: ['**/node_modules/**', '**/dist/**', '**/.turbo/**', '**/coverage/**'],
+  ignores: [
+    '**/node_modules/**',
+    '**/dist/**',
+    '**/.turbo/**',
+    '**/coverage/**',
+    '**/src/generated/**',
+    '**/.test-dist/**',
+  ],
 };
 
 export const toolingConfig = [

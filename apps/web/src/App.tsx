@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { getHealth } from './api';
+import AuthPanel from './AuthPanel';
 
 type ConnectionState =
   | { status: 'idle' }
@@ -52,10 +53,10 @@ export default function App() {
       <section className="intro">
         <p className="eyebrow">MONOREPO STARTER</p>
         <h1>从这里开始构建。</h1>
-        <p className="description">
-          React 前端与 NestJS 服务端已经就位。检查服务连接，然后开始你的第一个功能。
-        </p>
+        <p className="description">创建你的账号或登录，开始使用应用。</p>
       </section>
+
+      <AuthPanel />
 
       <section className="connection-card" aria-labelledby="connection-title">
         <div className="card-heading">

@@ -22,6 +22,9 @@ packages/
 
 ```bash
 corepack pnpm install
+cp .env.example .env
+corepack pnpm db:up
+corepack pnpm db:deploy
 corepack pnpm dev
 ```
 
@@ -43,7 +46,131 @@ PORT=3001 API_PROXY_TARGET=http://127.0.0.1:3001 corepack pnpm dev
 ```
 
 服务默认仅监听本机。修改监听地址后才能供其他设备访问。
-NestJS 当前读取 shell 环境变量，不会自动加载 `.env` 文件。
+后端优先读取 shell 环境变量，再读取 `apps/api/.env`；
+非生产环境还会读取根目录 `.env`。已有 `.env` 时不要覆盖它。
+
+## 本地 PostgreSQL
+
+使用 Docker Compose 运行 PostgreSQL 18。先安装并启动 Docker Desktop，
+然后在仓库根目录执行：
+
+```bash
+cp .env.example .env
+corepack pnpm db:up
+corepack pnpm db:status
+```
+
+`.env` 已被 Git 忽略。示例账号和密码仅用于本地开发，可在首次启动前修改。
+`db:up` 会拉取镜像、后台启动容器，并等待数据库健康检查通过。
+镜像固定在 PostgreSQL 18 大版本，重新拉取时可获得该系列更新；
+需要完全可重复的部署时，应进一步固定镜像标签或摘要。
+
+数据库仅开放在本机 `127.0.0.1:5432`，数据库名和用户名默认为 `demo`，
+密码来自 `.env`。端口冲突时修改 `.env` 中的 `POSTGRES_PORT` 后重新启动。
+可用数据库客户端连接，也可以进入容器内的 psql：
+
+```bash
+corepack pnpm db:shell
+```
+
+在 psql 中执行 `SELECT current_database(), current_user, version();` 验证连接，
+使用 `\q` 退出。其他管理命令：
+
+```bash
+corepack pnpm db:logs
+corepack pnpm db:down
+```
+
+`db:down` 移除容器和网络，但保留数据卷；再次启动会复用数据库数据。
+PostgreSQL 18 的持久化卷挂载在 `/var/lib/postgresql`。
+不要随意执行 `docker compose down -v`，它会删除本项目的数据卷。
+数据卷不是备份，也不要直接替换 PostgreSQL 大版本镜像来升级已有数据库。
+
+`POSTGRES_DB`、`POSTGRES_USER` 和 `POSTGRES_PASSWORD` 只在空数据卷首次初始化时生效；
+修改 `.env` 不会自动修改已有数据库的名称、账号或密码。
+容器初始化账号拥有较高权限，仅用于本地开发；生产应用应使用权限受限的账号。
+
+后端已通过 Prisma 接入数据库。开发环境未设置 `DATABASE_URL` 时，会根据
+根目录 `.env` 的 `POSTGRES_*` 构造本机连接地址；改端口或密码后应重启后端。
+生产环境必须显式提供 `DATABASE_URL`，不会回退到本地数据库配置。
+数据库连接信息只提供给后端，前端通过 `/api` 调用。
+
+## 用户注册与登录
+
+访问 <http://127.0.0.1:5173>，选择「注册」，填写昵称、邮箱和 12–128 个字符的密码。
+注册成功后自动登录；刷新页面会恢复登录状态，退出登录会撤销当前会话。
+每个浏览器会话固定有效 7 天，不自动续期；其他设备上的会话不受本次退出影响。
+
+| 接口                      | 行为                                             |
+| ------------------------- | ------------------------------------------------ |
+| `POST /api/auth/register` | 接收 `{ name, email, password }`，创建用户并登录 |
+| `POST /api/auth/login`    | 接收 `{ email, password }`，创建新会话           |
+| `GET /api/auth/me`        | 返回 `{ user }`，未登录或会话失效返回 401        |
+| `POST /api/auth/logout`   | 撤销当前会话、清除 Cookie，返回 204              |
+
+邮箱去除首尾空格并转为小写，数据库唯一约束防止并发重复注册。
+密码使用 Argon2id 哈希，会话使用 32 字节随机令牌，数据库只保存令牌的 SHA-256 哈希。
+用户响应只包含 `id`、`email`、`name` 和 `createdAt`，不会返回密码哈希或会话令牌。
+禁用账号不能登录，也不能继续使用已有会话。
+
+会话通过 HttpOnly、SameSite=Lax Cookie 传递，前端不会将令牌保存到 localStorage。
+所有认证 POST 请求必须带有可信 `Origin`，默认允许
+`http://127.0.0.1:5173` 和 `http://localhost:5173`；
+可通过 `AUTH_ALLOWED_ORIGINS` 设置逗号分隔的完整来源，不要附加路径或末尾斜杠。
+使用 curl 等客户端时，也需要提供 `Origin` 请求头并保存/发送 Cookie。
+
+`apps/api/src/auth` 管理认证逻辑，`apps/api/src/database` 提供 Prisma 连接，
+`apps/api/prisma/schema.prisma` 定义用户和会话表，`prisma/migrations` 保存 SQL 迁移。
+后续受保护接口可以导入 `AuthModule` 并使用 `@UseGuards(SessionGuard)`，
+从 `AuthenticatedRequest.authUser` 获取当前用户。
+
+修改模型后的开发流程：
+
+```bash
+corepack pnpm db:migrate --name describe_your_change
+corepack pnpm db:generate
+```
+
+提交 schema 和 migration 文件；生成的客户端已被 Git、ESLint 和 Prettier 忽略。
+`pnpm dev` 会生成客户端，根目录的构建、lint 和类型检查由 Turbo 统一先运行生成任务，
+避免多个检查同时写入生成目录。单独运行 API 的构建或检查前，请先执行 `db:generate`。
+
+已有迁移部署到新环境、查看数据和清理过期会话：
+
+```bash
+corepack pnpm db:deploy
+corepack pnpm db:studio
+corepack pnpm db:sessions:cleanup
+```
+
+Studio 的访问地址以终端输出为准，Ctrl+C 停止。`db:deploy` 应用于部署已有迁移，
+不要在生产环境运行 `db:migrate`。清理命令只删除已过期的会话；
+运行环境需要定期执行它来控制表大小，过期会话即使未清理也不能用于登录。
+
+认证集成测试：
+
+```bash
+corepack pnpm test:integration
+```
+
+测试会将 API 构建到独立的 `.test-dist`，在本地数据库创建随机命名的独立 schema，应用迁移、
+启动独立端口的 API，检查注册、密码校验、Cookie、会话撤销、过期、禁用和限流，
+完成后删除测试 schema。需要数据库账号拥有创建 schema 权限；
+禁止在 `NODE_ENV=production` 下执行，生产数据库凭据不要提供给测试。
+
+### 生产部署配置
+
+- 设置 `NODE_ENV=production`、`DATABASE_URL` 和 HTTPS `AUTH_ALLOWED_ORIGINS`。
+  生产 Cookie 使用 `__Host-demo_session` 名称并启用 Secure，必须通过 HTTPS 访问。
+- 当前前端通过同源 `/api` 访问后端，生产反向代理也应保持这个结构。
+  后端默认监听 `127.0.0.1`，适用于本机反向代理；容器部署时需要另行配置监听地址。
+- 默认不信任代理头。若在受控反向代理后运行，根据实际拓扑设置 `TRUST_PROXY_HOPS`，
+  以便限流使用真实客户端地址；不可仅凭客户端传入的头部信任来源。
+- 注册和登录各限制每个 IP 每分钟 10 次，其他认证接口每分钟 60 次。
+  当前限流存储在单个进程内；多实例部署需接入共享限流存储或在网关统一限流。
+  会话本身存储在 PostgreSQL，可供多个实例共享。
+- 已完成基础认证，邮件验证、密码重置、权限管理和审计日志尚未实现。
+  上线前还需配置数据库最小权限、备份恢复、监控及发布流程。
 
 ## 常用命令
 
@@ -73,7 +200,8 @@ Vite 的开发代理不是生产部署方案。
 - 两个应用的 ESLint 配置只调用对应的共享工厂，并传入自身目录。
 - TypeScript 基础配置启用 `strict`、`noUncheckedIndexedAccess`、
   `exactOptionalPropertyTypes` 等检查。
-- React 使用 Bundler 模块解析；NestJS 使用 CommonJS 和 decorator metadata。
+- React 使用 Bundler 模块解析；NestJS 使用 Node16 解析、
+  CommonJS 和 decorator metadata，兼容 Prisma 的包导出配置。
 - NestJS 不强制 type-only import，以保留构造函数注入需要的运行时类元数据。
 - 新增应用通过 `workspace:*` 声明共享配置依赖，不直接引用其他包的源码。
 - Turbo 将共享配置文件纳入全局缓存输入；修改规范会使已有任务缓存失效。

@@ -4,7 +4,10 @@ packages:
 
 onlyBuiltDependencies:
   - '@nestjs/core'
+  - '@prisma/engines'
+  - argon2
   - esbuild
+  - prisma
 
 overrides:
   # Nest CLI pins an older webpack; schema-utils requires this newer release.
