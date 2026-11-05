@@ -13,23 +13,26 @@
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio --browser none",
-    "users:admin": "prisma generate && nest build --path tsconfig.integration.json && node scripts/grant-admin.mjs",
+    "users:admin": "corepack pnpm --filter @repo/contracts build && prisma generate && nest build --path tsconfig.integration.json && node scripts/grant-admin.mjs",
     "db:sessions:cleanup": "prisma db execute --file prisma/cleanup-sessions.sql",
-    "test:integration": "prisma generate && nest build --path tsconfig.integration.json && node --test test/auth.integration.test.mjs"
+    "test:integration": "corepack pnpm --filter @repo/contracts build && prisma generate && nest build --path tsconfig.integration.json && node --test test/auth.integration.test.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.8",
     "@nestjs/core": "^11.2.8",
     "@nestjs/platform-express": "^11.2.8",
     "@nestjs/throttler": "6.7.1",
+    "@repo/contracts": "workspace:*",
+    "@ts-rest/core": "3.52.1",
+    "@ts-rest/nest": "3.52.1",
     "@prisma/adapter-pg": "7.10.1",
     "@prisma/client": "7.10.1",
+    "@prisma/driver-adapter-utils": "7.10.1",
     "argon2": "0.45.2",
-    "class-transformer": "0.5.1",
-    "class-validator": "0.15.1",
     "dotenv": "18.0.9",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2"
+    "rxjs": "^7.8.2",
+    "zod": "3.25.76"
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.0",

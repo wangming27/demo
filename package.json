@@ -20,7 +20,7 @@
     "db:studio": "corepack pnpm --filter @repo/api db:studio",
     "users:admin": "corepack pnpm --filter @repo/api users:admin",
     "db:sessions:cleanup": "corepack pnpm --filter @repo/api db:sessions:cleanup",
-    "test:integration": "corepack pnpm --filter @repo/api test:integration",
+    "test:integration": "corepack pnpm --filter @repo/api test:integration && corepack pnpm --filter @repo/web test:api",
     "build": "turbo run build",
     "lint": "eslint . --max-warnings 0 && turbo run lint",
     "lint:fix": "eslint . --fix && turbo run lint:fix",

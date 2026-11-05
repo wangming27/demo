@@ -1,156 +1,53 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { getCurrentUser, logout } from './api';
-import type { User } from './api';
-import AdminDashboard from './AdminDashboard';
-import AuthPanel from './AuthPanel';
-import Icon from './Icon';
-
-type SessionState =
-  | { status: 'loading' }
-  | { status: 'anonymous'; notice: string }
-  | { status: 'authenticated'; user: User }
-  | { status: 'error'; message: string };
+import { Navigate, Route, Routes } from 'react-router';
+import SessionFeedback from './components/session/SessionFeedback';
+import useSession from './hooks/useSession';
+import LoginPage from './pages/login/LoginPage';
+import NotFoundPage from './pages/not-found/NotFoundPage';
+import UsersPage from './pages/users/UsersPage';
 
 export default function App() {
-  const [session, setSession] = useState<SessionState>({ status: 'loading' });
-  const [pending, setPending] = useState<'refresh' | 'logout' | null>(null);
-  const [error, setError] = useState('');
-  const requestRef = useRef<AbortController | null>(null);
-  const sessionExpired = useCallback(() => {
-    requestRef.current?.abort();
-    setPending(null);
-    setSession({ status: 'anonymous', notice: '登录已失效，请重新登录。' });
-  }, []);
+  const account = useSession();
+  const { session } = account;
 
-  async function restoreSession(signal: AbortSignal) {
-    try {
-      const user = await getCurrentUser(signal);
-      if (!signal.aborted) {
-        setSession(user ? { status: 'authenticated', user } : { status: 'anonymous', notice: '' });
-      }
-    } catch (error: unknown) {
-      if (!signal.aborted) {
-        setSession({
-          status: 'error',
-          message: error instanceof Error ? error.message : '服务暂时不可用，请稍后重试',
-        });
-      }
-    }
-  }
-
-  useEffect(() => {
-    const controller = new AbortController();
-    requestRef.current = controller;
-    void getCurrentUser(controller.signal)
-      .then((user) => {
-        if (!controller.signal.aborted) {
-          setSession(
-            user ? { status: 'authenticated', user } : { status: 'anonymous', notice: '' },
-          );
-        }
-      })
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) {
-          setSession({
-            status: 'error',
-            message: error instanceof Error ? error.message : '服务暂时不可用，请稍后重试',
-          });
-        }
-      });
-    return () => requestRef.current?.abort();
-  }, []);
-
-  function retry() {
-    requestRef.current?.abort();
-    const controller = new AbortController();
-    requestRef.current = controller;
-    setSession({ status: 'loading' });
-    void restoreSession(controller.signal);
-  }
-
-  async function accountAction(action: 'refresh' | 'logout') {
-    if (pending) return;
-    requestRef.current?.abort();
-    const controller = new AbortController();
-    requestRef.current = controller;
-    setPending(action);
-    setError('');
-    try {
-      if (action === 'logout') {
-        await logout(controller.signal);
-        if (!controller.signal.aborted) {
-          setSession({ status: 'anonymous', notice: '已安全退出登录。' });
-        }
-      } else {
-        const user = await getCurrentUser(controller.signal);
-        if (!controller.signal.aborted) {
-          setSession(
-            user
-              ? { status: 'authenticated', user }
-              : { status: 'anonymous', notice: '登录已失效，请重新登录。' },
-          );
-        }
-      }
-    } catch (error: unknown) {
-      if (!controller.signal.aborted) {
-        setError(error instanceof Error ? error.message : '操作失败，请稍后重试');
-      }
-    } finally {
-      if (requestRef.current === controller) {
-        requestRef.current = null;
-        setPending(null);
-      }
-    }
-  }
-
-  if (session.status === 'authenticated') {
-    return (
-      <AdminDashboard
-        user={session.user}
-        pending={pending}
-        error={error}
-        onRefresh={() => void accountAction('refresh')}
-        onLogout={() => void accountAction('logout')}
-        onSessionExpired={sessionExpired}
-        onUserChanged={(user) => setSession({ status: 'authenticated', user })}
-      />
-    );
-  }
-
-  if (session.status === 'anonymous') {
-    return (
-      <AuthPanel
-        notice={session.notice}
-        onAuthenticated={(user) => {
-          setError('');
-          setSession({ status: 'authenticated', user });
-        }}
-      />
-    );
+  if (session.status === 'loading' || session.status === 'error') {
+    return <SessionFeedback state={session} onRetry={account.retry} />;
   }
 
   return (
-    <main className="session-page">
-      <div className="session-card">
-        <span className="brand-symbol">
-          <Icon name="layers" />
-        </span>
-        <h1>Demo Console</h1>
-        {session.status === 'loading' ? (
-          <p className="muted" role="status">
-            <span className="spinner" /> 正在确认登录状态…
-          </p>
-        ) : (
-          <>
-            <p className="error" role="alert">
-              {session.message}
-            </p>
-            <button className="primary-button" onClick={retry}>
-              重新连接
-            </button>
-          </>
-        )}
-      </div>
-    </main>
+    <Routes>
+      <Route
+        path="/"
+        element={<Navigate to={session.status === 'authenticated' ? '/users' : '/login'} replace />}
+      />
+      <Route
+        path="/login"
+        element={
+          session.status === 'authenticated' ? (
+            <Navigate to="/users" replace />
+          ) : (
+            <LoginPage notice={session.notice} onAuthenticated={account.authenticated} />
+          )
+        }
+      />
+      <Route
+        path="/users"
+        element={
+          session.status === 'authenticated' ? (
+            <UsersPage
+              user={session.user}
+              pending={account.pending}
+              error={account.error}
+              onRefresh={account.refresh}
+              onLogout={account.logout}
+              onSessionExpired={account.sessionExpired}
+              onUserChanged={account.userChanged}
+            />
+          ) : (
+            <Navigate to="/login" replace />
+          )
+        }
+      />
+      <Route path="*" element={<NotFoundPage />} />
+    </Routes>
   );
 }

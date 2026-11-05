@@ -1,12 +1,8 @@
 import type { Request } from 'express';
-import type { UserRole } from '../generated/prisma/client';
+import type { PublicUser as PublicUserResponse } from '@repo/contracts';
 
-export interface PublicUser {
-  id: string;
-  email: string;
-  name: string;
+export interface PublicUser extends Omit<PublicUserResponse, 'createdAt'> {
   createdAt: Date;
-  role: UserRole;
 }
 
 export interface AuthenticatedRequest extends Request {

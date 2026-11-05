@@ -1,0 +1,33 @@
+@import 'tailwindcss' important;
+
+@theme inline {
+  --color-surface: var(--semi-color-bg-1);
+  --color-canvas: var(--semi-color-bg-0);
+  --color-muted: var(--semi-color-text-2);
+  --color-line: var(--semi-color-border);
+}
+
+@layer base {
+  body {
+    margin: 0;
+    min-width: 320px;
+    color: var(--semi-color-text-0);
+    font-family:
+      Inter,
+      -apple-system,
+      BlinkMacSystemFont,
+      'Segoe UI',
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  button,
+  input,
+  select {
+    font: inherit;
+  }
+}
+
+.icon {
+  flex-shrink: 0;
+}

@@ -9,13 +9,19 @@
     "preview": "vite preview",
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b",
+    "test:api": "node --experimental-transform-types --test test/api.test.mjs"
   },
   "dependencies": {
+    "@douyinfe/semi-ui": "2.104.0",
+    "@repo/contracts": "workspace:*",
+    "@ts-rest/core": "3.52.1",
     "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "react-dom": "^19.2.0",
+    "react-router": "^7.0.0"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "4.3.4",
     "@repo/eslint-config": "workspace:*",
     "@repo/typescript-config": "workspace:*",
     "@types/node": "^22.18.0",
@@ -23,6 +29,7 @@
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.1.0",
     "eslint": "^9.39.0",
+    "tailwindcss": "4.3.4",
     "typescript": "~5.9.3",
     "vite": "^7.3.7"
   }

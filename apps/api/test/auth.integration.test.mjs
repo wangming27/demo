@@ -8,9 +8,11 @@ import { resolve } from 'node:path';
 import { after, before, test } from 'node:test';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { verify } from 'argon2';
+import { initClient } from '@ts-rest/core';
 import prismaConfig from '../prisma.config.mjs';
 
 const require = createRequire(import.meta.url);
+const { apiContract, HealthResponseSchema, PublicUserSchema } = require('@repo/contracts');
 const { PrismaClient } = require('../.test-dist/generated/prisma/client.js');
 const apiDir = resolve(import.meta.dirname, '..');
 const origin = 'http://127.0.0.1:5173';
@@ -646,7 +648,17 @@ test('administrator user management', async (t) => {
       ),
     ]);
     assert.equal(responses.filter((response) => response.status === 200).length, 1);
-    assert.ok(responses.every((response) => [200, 401, 403, 409].includes(response.status)));
+    assert.ok(
+      responses.every((response) => [200, 401, 403, 409].includes(response.status)),
+      JSON.stringify(
+        await Promise.all(
+          responses.map(async (response) => ({
+            status: response.status,
+            body: await response.json(),
+          })),
+        ),
+      ),
+    );
     assert.equal(await prisma.user.count({ where: { role: 'ADMIN', status: 'ACTIVE' } }), 1);
   });
 });
@@ -662,4 +674,60 @@ test('repeated login attempts are rate limited', async () => {
     assert.equal(response.status, 401);
   }
   assert.equal(limited, true);
+});
+
+test('shared client and server agree on routes, response schemas and error bodies', async () => {
+  const client = initClient(apiContract, {
+    baseUrl,
+    baseHeaders: { Origin: origin },
+    validateResponse: true,
+  });
+  const health = await client.health.get();
+  assert.equal(health.status, 200);
+  assert.equal(HealthResponseSchema.safeParse(health.body).success, true);
+  const anonymous = await client.auth.me();
+  assert.equal(anonymous.status, 401);
+  assert.equal(typeof anonymous.body.message, 'string');
+
+  const { createToken } = require('../.test-dist/auth/session.js');
+  const value = `demo_session=${createToken()}`;
+  await prisma.session.create({
+    data: { userId, tokenHash: tokenHash(value), expiresAt: new Date(Date.now() + 60_000) },
+  });
+  try {
+    const current = await client.auth.me({ extraHeaders: { Cookie: value } });
+    assert.equal(current.status, 200);
+    assert.equal(PublicUserSchema.safeParse(current.body.user).success, true);
+    assert.equal(current.body.user.id, userId);
+    assert.equal(typeof current.body.user.createdAt, 'string');
+    const forbidden = await client.users.list({
+      query: { page: 1, pageSize: 10 },
+      extraHeaders: { Cookie: value },
+    });
+    assert.equal(forbidden.status, 403);
+    assert.equal(typeof forbidden.body.message, 'string');
+  } finally {
+    await prisma.session.deleteMany({ where: { tokenHash: tokenHash(value) } });
+  }
+});
+
+test('shared client rejects responses that violate the contract', async (t) => {
+  t.mock.method(globalThis, 'fetch', () =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({ status: 'ok', service: '@repo/api', timestamp: 'not-a-date' }),
+        { headers: { 'Content-Type': 'application/json' } },
+      ),
+    ),
+  );
+  const client = initClient(apiContract, {
+    baseUrl: '',
+    baseHeaders: {},
+    validateResponse: true,
+  });
+  await assert.rejects(
+    client.health.get(),
+    (error) =>
+      error.name === 'ZodError' && error.issues.some((issue) => issue.path[0] === 'timestamp'),
+  );
 });

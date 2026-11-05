@@ -2,7 +2,7 @@ import { ConflictException, Injectable, OnModuleInit, UnauthorizedException } fr
 import { verify } from 'argon2';
 import { PrismaService } from '../database/prisma.service';
 import { Prisma } from '../generated/prisma/client';
-import { CredentialsDto, RegisterDto } from './auth.dto';
+import type { Credentials, Registration } from '@repo/contracts';
 import { PublicUser } from './auth.types';
 import { hashPassword } from './password';
 import { createToken, hashToken, SESSION_DURATION_MS } from './session';
@@ -27,7 +27,7 @@ export class AuthService implements OnModuleInit {
   }
 
   async register(
-    input: RegisterDto,
+    input: Registration,
     previousToken: string | undefined,
   ): Promise<{ user: PublicUser; token: string }> {
     const passwordHash = await hashPassword(input.password);
@@ -49,7 +49,7 @@ export class AuthService implements OnModuleInit {
   }
 
   async login(
-    input: CredentialsDto,
+    input: Credentials,
     previousToken: string | undefined,
   ): Promise<{ user: PublicUser; token: string }> {
     const user = await this.prisma.user.findUnique({

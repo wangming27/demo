@@ -1,10 +1,6 @@
 import { Injectable } from '@nestjs/common';
 
-interface HealthResponse {
-  status: 'ok';
-  service: string;
-  timestamp: string;
-}
+import type { HealthResponse } from '@repo/contracts';
 
 @Injectable()
 export class AppService {

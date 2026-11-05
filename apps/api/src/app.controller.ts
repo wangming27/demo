@@ -1,12 +1,19 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller } from '@nestjs/common';
+import { healthContract } from '@repo/contracts';
+import { TsRestHandler, tsRestHandler } from '@ts-rest/nest';
 import { AppService } from './app.service';
 
-@Controller('health')
+@Controller()
 export class AppController {
   constructor(private readonly appService: AppService) {}
 
-  @Get()
+  @TsRestHandler(healthContract.get, { validateResponses: true })
   getHealth() {
-    return this.appService.getHealth();
+    return tsRestHandler(healthContract.get, () =>
+      Promise.resolve({
+        status: 200,
+        body: this.appService.getHealth(),
+      }),
+    );
   }
 }

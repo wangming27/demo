@@ -4,10 +4,11 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { isDriverAdapterError } from '@prisma/driver-adapter-utils';
 import { hashPassword } from '../auth/password';
 import { PrismaService } from '../database/prisma.service';
 import { Prisma } from '../generated/prisma/client';
-import { CreateUserDto, ListUsersDto, UpdateUserDto } from './users.dto';
+import type { CreateUserInput, ListUsersInput, UserUpdate } from '@repo/contracts';
 
 const userSelect = {
   id: true,
@@ -23,7 +24,7 @@ const userSelect = {
 export class UsersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async list(input: ListUsersDto) {
+  async list(input: ListUsersInput) {
     const where: Prisma.UserWhereInput = {
       ...(input.status ? { status: input.status } : {}),
       ...(input.search
@@ -66,7 +67,7 @@ export class UsersService {
     return { user };
   }
 
-  async create(actorId: string, input: CreateUserDto) {
+  async create(actorId: string, input: CreateUserInput) {
     const passwordHash = await hashPassword(input.password);
     return this.write(async (transaction) => {
       await this.assertAdmin(transaction, actorId);
@@ -78,7 +79,7 @@ export class UsersService {
     });
   }
 
-  async update(actorId: string, id: string, input: UpdateUserDto) {
+  async update(actorId: string, id: string, input: UserUpdate) {
     return this.write(async (transaction) => {
       await this.assertAdmin(transaction, actorId);
       const current = await transaction.user.findUnique({ where: { id }, select: userSelect });
@@ -135,10 +136,13 @@ export class UsersService {
       } catch (error: unknown) {
         if (error instanceof Prisma.PrismaClientKnownRequestError) {
           if (error.code === 'P2002') throw new ConflictException('该邮箱已注册');
-          if (error.code === 'P2034') {
-            if (attempt < 2) continue;
-            throw new ConflictException('账号信息正在被修改，请刷新后重试');
-          }
+        }
+        const writeConflict =
+          (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2034') ||
+          (isDriverAdapterError(error) && error.cause.kind === 'TransactionWriteConflict');
+        if (writeConflict) {
+          if (attempt < 2) continue;
+          throw new ConflictException('账号信息正在被修改，请刷新后重试');
         }
         throw error;
       }

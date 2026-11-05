@@ -2,6 +2,14 @@
 
 使用 pnpm workspace、Turborepo 和 Changesets 的 TypeScript monorepo。
 
+前端组件使用 **Semi Design**，样式使用 **Tailwind CSS v4**。
+表单、按钮、表格、分页、弹窗和导航优先使用 Semi 组件；
+布局、间距和响应式调整使用 Tailwind utility class。
+`apps/web/vite.config.ts` 通过 `@tailwindcss/vite` 集成 Tailwind，
+`apps/web/src/styles/global.css` 将背景、文字和边框颜色映射到 Semi 主题变量。
+Tailwind utilities 使用 `important` 保证显式样式可覆盖 Semi 默认组件样式，
+全局基础样式保留在 `base` layer，避免覆盖组件内部样式。
+
 ## 目录
 
 ```text
@@ -9,11 +17,32 @@ apps/
   web/                       Vite + React 前端
   api/                       NestJS 服务端
 packages/
+  contracts/                 Zod schema + ts-rest 接口契约，前后端共同依赖
   eslint-config/             ESLint flat config：基础工具、React、NestJS
   prettier-config/           统一格式化配置
   typescript-config/         严格基础配置及 React / NestJS 预设
 .changeset/                  包版本管理
 ```
+
+前端 `apps/web/src` 按职责组织：
+
+```text
+App.tsx                      路由配置与登录访问控制
+main.tsx                     React / BrowserRouter 入口
+pages/                       页面：login、users、not-found
+components/                  公共组件、会话反馈组件、用户管理组件
+hooks/                       会话恢复与账号操作
+services/                    基于共享契约的 API 客户端
+utils/                       日期格式化等纯工具函数
+styles/                      全局样式与 Tailwind 主题映射
+```
+
+页面路由使用 React Router 7：`/login` 为登录与注册，`/users` 为用户管理，
+`/` 按登录状态跳转，其他地址展示 404。会话恢复完成后才执行路由登录校验；
+未登录访问 `/users` 时跳转 `/login`，已登录访问 `/login` 时跳转 `/users`。
+普通用户在 `/users` 看到权限提示，管理员可操作用户列表。
+生产环境的静态服务器需将页面地址回退到 `index.html`，以支持直接访问和刷新页面；
+`/api` 请求应继续转发到 NestJS。
 
 ## 环境与启动
 
@@ -35,9 +64,13 @@ corepack pnpm dev
 单独启动：
 
 ```bash
+corepack pnpm --filter @repo/contracts build
 corepack pnpm --filter @repo/web dev
 corepack pnpm --filter @repo/api dev
 ```
+
+根目录 `pnpm dev` 会先构建共享契约，并同时监听契约源码的变化。
+单独启动应用时，另开终端运行 `corepack pnpm --filter @repo/contracts dev` 可监听契约变化。
 
 服务端端口可用 `PORT` 覆盖；同时用 `API_PROXY_TARGET` 配置前端代理目标：
 
@@ -214,6 +247,8 @@ corepack pnpm users:admin your-email@example.com
 账号删除暂不提供，使用停用保留账号资料。密码重置、邮件通知、审计日志和
 更细粒度的权限尚未接入。认证与用户管理集成测试统一运行 `corepack pnpm test:integration`，
 覆盖越权、分页、字段泄漏、编辑冲突、会话撤销和并发管理员保护。
+同一命令还会运行前端请求封装测试，检查契约路径、响应校验、错误提示和请求取消；
+单独运行前端测试可使用 `corepack pnpm --filter @repo/web test:api`（先构建契约包）。
 
 ## 常用命令
 
@@ -238,6 +273,21 @@ corepack pnpm --filter @repo/api start
 Vite 的开发代理不是生产部署方案。
 
 ## 共享配置
+
+### 接口契约
+
+`packages/contracts/src/schemas.ts` 定义请求/响应的数据结构与校验规则；
+`src/index.ts` 定义 HTTP 方法、完整路径、参数和响应状态码。类型从 Zod schema 推导，
+前后端通过 `@repo/contracts` 导入，不直接依赖对方应用或 Prisma 的生成类型。
+
+新增接口时先添加 schema 和契约，再由 API 的 `@TsRestHandler` 实现，
+前端通过 ts-rest 客户端调用。两端均开启响应校验，请求的未知字段会被拒绝，
+默认值、邮箱归一化、分页转换等规则由共享 schema 统一维护。
+服务端内部保留 `Date`，在控制器边界显式序列化为契约规定的 ISO 字符串。
+权限判断、Cookie、数据库事务仍由服务端管理；页面筛选状态及错误提示由前端管理。
+
+契约自带 `/api` 前缀，控制器与 Nest 全局配置不再重复添加前缀。
+根目录检查和构建由 Turbo 先构建契约；单独检查或构建应用前需先构建契约。
 
 - ESLint 负责代码质量，Prettier 负责格式化；`eslint-config-prettier` 关闭冲突规则。
 - 两个应用的 ESLint 配置只调用对应的共享工厂，并传入自身目录。

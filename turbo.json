@@ -21,17 +21,18 @@
       "env": ["VITE_*"]
     },
     "lint": {
-      "dependsOn": ["^lint", "db:generate"],
+      "dependsOn": ["^build", "^lint", "db:generate"],
       "outputs": []
     },
     "lint:fix": {
       "cache": false
     },
     "typecheck": {
-      "dependsOn": ["^typecheck", "db:generate"],
+      "dependsOn": ["^build", "^typecheck", "db:generate"],
       "outputs": []
     },
     "dev": {
+      "dependsOn": ["^build"],
       "cache": false,
       "persistent": true,
       "passThroughEnv": [

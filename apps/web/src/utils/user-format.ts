@@ -7,6 +7,6 @@ export function formatDate(value: string, includeTime = false) {
   }).format(new Date(value));
 }
 
-export function initialOf(name: string) {
+export function initialOf(name: string): string {
   return Array.from(name.trim())[0]?.toLocaleUpperCase() ?? 'U';
 }

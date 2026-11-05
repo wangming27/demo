@@ -1,10 +1,11 @@
 import 'reflect-metadata';
 import './config/environment';
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { getEnvironment } from './config/environment';
+import { ContractValidationFilter } from './contracts/validation.filter';
 
 async function bootstrap(): Promise<void> {
   const environment = getEnvironment();
@@ -19,15 +20,7 @@ async function bootstrap(): Promise<void> {
     app.set('trust proxy', environment.trustProxyHops);
   }
   app.useBodyParser('json', { limit: '16kb' });
-  app.useGlobalPipes(
-    new ValidationPipe({
-      transform: true,
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      forbidUnknownValues: true,
-    }),
-  );
-  app.setGlobalPrefix('api');
+  app.useGlobalFilters(new ContractValidationFilter());
   app.enableShutdownHooks();
 
   try {
