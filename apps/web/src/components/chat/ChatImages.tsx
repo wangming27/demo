@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Button } from '@douyinfe/semi-ui';
 import { CHAT_IMAGE_MAX_BYTES, CHAT_IMAGES_PER_MESSAGE, ChatImageSchema } from '@repo/contracts';
 import type { ChatImage } from '@repo/contracts';
@@ -44,12 +45,14 @@ export default function ChatImages({
   onChange,
   onError,
   onBusyChange,
+  children,
 }: {
   images: ChatImage[];
   disabled: boolean;
   onChange: (images: ChatImage[]) => void;
   onError: (message: string) => void;
   onBusyChange: (busy: boolean) => void;
+  children: ReactNode;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [busy, setBusy] = useState(false);
@@ -115,20 +118,17 @@ export default function ChatImages({
           void select(files);
         }}
       />
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex items-center justify-end gap-2">
         <Button
           size="small"
           theme="borderless"
           icon={<Icon name="image" />}
+          aria-label="添加图片"
           loading={busy}
           disabled={disabled || busy || images.length >= CHAT_IMAGES_PER_MESSAGE}
           onClick={() => inputRef.current?.click()}
-        >
-          添加图片
-        </Button>
-        <span className="text-xs text-muted">
-          PNG / JPEG / WebP · 每张 ≤ 2 MB · 最多 4 张 · 只发图片时默认描述内容
-        </span>
+        />
+        {children}
       </div>
     </div>
   );

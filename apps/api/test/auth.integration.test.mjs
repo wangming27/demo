@@ -684,6 +684,7 @@ test('chat configuration ownership and model proxy', async (t) => {
   const otherCookie = await fixtureCookie(other.id);
   let upstreamStatus = 200;
   let upstreamBody = { choices: [{ message: { content: '模型回复：你好' } }] };
+  let streamMode = 'success';
   let received;
   const upstream = createHttpServer(async (request, response) => {
     let body = '';
@@ -693,6 +694,16 @@ test('chat configuration ownership and model proxy', async (t) => {
       authorization: request.headers.authorization,
       body: JSON.parse(body),
     };
+    if (received.body.stream) {
+      response.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      response.write('data: {"choices":[{"index":0,"delta":{"reasoning_content":"先思考"}}]}\n\n');
+      if (streamMode === 'success') {
+        response.end(
+          'data: {"choices":[{"index":0,"delta":{"content":"流式回答"}}]}\n\ndata: [DONE]\n\n',
+        );
+      } else response.end();
+      return;
+    }
     response.writeHead(upstreamStatus, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify(upstreamBody));
   });
@@ -732,6 +743,10 @@ test('chat configuration ownership and model proxy', async (t) => {
   let second;
 
   await t.test('requires session and trusted origin, validates configuration', async () => {
+    const streamBody = { modelId: randomUUID(), messages: [{ role: 'user', content: '测试' }] };
+    assert.equal((await chat('/stream', 'POST', streamBody, '')).status, 401);
+    assert.equal((await chat('/stream', 'POST', streamBody, ownerCookie, '')).status, 403);
+    assert.equal((await chat('/stream', 'POST', { ...streamBody, messages: [] })).status, 400);
     assert.equal((await chat('/models', 'GET', undefined, '')).status, 401);
     assert.equal((await chat('/models', 'POST', { ...input, baseUrl: 'invalid' })).status, 400);
     assert.equal((await chat('/models', 'POST', input, ownerCookie, '')).status, 403);
@@ -803,6 +818,51 @@ test('chat configuration ownership and model proxy', async (t) => {
       200,
     );
   });
+  await t.test(
+    'stream endpoint validates ownership, sends timing and preserves errors after partial output',
+    async () => {
+      const body = {
+        modelId: first.id,
+        messages: [{ role: 'user', content: '你好' }],
+        debug: true,
+      };
+      assert.equal((await chat('/stream', 'POST', body, otherCookie)).status, 404);
+      const { SseDecoder, ChatStreamEventSchema } = require('@repo/contracts');
+      const success = await chat('/stream', 'POST', {
+        ...body,
+        messages: [{ role: 'user', content: '长'.repeat(10_000) }],
+      });
+      assert.equal(success.status, 200);
+      assert.match(success.headers.get('content-type'), /text\/event-stream/);
+      assert.equal(success.headers.get('cache-control'), 'no-store');
+      const events = new SseDecoder()
+        .push(await success.text())
+        .map((data) => ChatStreamEventSchema.parse(JSON.parse(data)));
+      assert.equal(events.find((event) => event.type === 'delta').reasoning, '先思考');
+      const done = events.at(-1);
+      assert.equal(done.type, 'done');
+      assert.equal(done.answer.content, '流式回答');
+      assert.equal(done.timing.thoughts.length, 1);
+      assert.equal(done.timing.phase, 'done');
+      assert.equal(done.answer.debug.status, 'success');
+      assert.equal(received.body.stream, true);
+      assert.equal(received.body.messages[0].content.length, 10_000);
+      streamMode = 'truncated';
+      const failed = await chat('/stream', 'POST', body);
+      const failedEvents = new SseDecoder()
+        .push(await failed.text())
+        .map((data) => ChatStreamEventSchema.parse(JSON.parse(data)));
+      assert.equal(failed.status, 200);
+      assert.equal(failedEvents.at(-1).type, 'error');
+      assert.equal(failedEvents.at(-1).status, 502);
+      assert.equal(failedEvents.at(-1).debug.status, 'error');
+      assert.equal(
+        failedEvents.some((event) => event.type === 'done'),
+        false,
+      );
+      streamMode = 'success';
+    },
+  );
   await t.test('forwards selected model and multi-turn history using the server key', async () => {
     const messages = [
       { role: 'user', content: '第一条' },

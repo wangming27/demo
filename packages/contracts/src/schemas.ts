@@ -282,6 +282,43 @@ export type ChatMessage = z.output<typeof ChatMessageSchema>;
 export type ChatImage = z.output<typeof ChatImageSchema>;
 export type ChatCompletion = z.output<typeof ChatCompletionSchema>;
 export type ChatCompletionResponse = z.output<typeof ChatCompletionResponseSchema>;
+const duration = z.number().finite().nonnegative();
+const span = z.object({
+  round: z.number().int().min(1).max(4),
+  startMs: duration,
+  endMs: duration.nullable(),
+});
+export const ChatTimingSchema = z.object({
+  elapsedMs: duration,
+  firstResponseMs: duration.nullable(),
+  phase: z.enum(['waiting', 'thinking', 'answering', 'tool', 'finishing', 'done']),
+  thoughts: z.array(span).max(32),
+  tools: z.array(span.extend({ id: z.string(), name: z.string() })).max(4),
+});
+export const ChatStreamEventSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('state'), timing: ChatTimingSchema }),
+  z.object({
+    type: z.literal('delta'),
+    round: z.number().int().min(1).max(4),
+    reasoning: z.string().max(100_000).optional(),
+    content: z.string().max(100_000).optional(),
+    toolCall: z.boolean().optional(),
+  }),
+  z.object({
+    type: z.literal('done'),
+    answer: ChatCompletionResponseSchema,
+    timing: ChatTimingSchema,
+  }),
+  z.object({
+    type: z.literal('error'),
+    message: z.string(),
+    status: z.number().int(),
+    debug: ChatDebugTraceSchema.optional(),
+    timing: ChatTimingSchema,
+  }),
+]);
+export type ChatTiming = z.output<typeof ChatTimingSchema>;
+export type ChatStreamEvent = z.output<typeof ChatStreamEventSchema>;
 
 export type PublicUser = z.output<typeof PublicUserSchema>;
 export type ManagedUser = z.output<typeof ManagedUserSchema>;

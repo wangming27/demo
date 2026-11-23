@@ -1,4 +1,9 @@
-import { apiContract, ChatDebugTraceSchema } from '@repo/contracts';
+import {
+  apiContract,
+  ChatDebugTraceSchema,
+  ChatStreamEventSchema,
+  SseDecoder,
+} from '@repo/contracts';
 import type {
   Credentials,
   HealthResponse,
@@ -14,6 +19,7 @@ import type {
   ChatCompletion,
   ChatCompletionResponse,
   ChatDebugTrace,
+  ChatStreamEvent,
 } from '@repo/contracts';
 import { initClient, ResponseValidationError, validateResponse } from '@ts-rest/core';
 
@@ -238,4 +244,57 @@ export async function sendChat(
   const result = await request(client.chat.complete({ body: input, fetchOptions: { signal } }));
   assertStatus(result, 200);
   return result.body;
+}
+
+export async function streamChat(
+  input: ChatCompletion,
+  signal: AbortSignal,
+  onEvent: (event: ChatStreamEvent) => void,
+): Promise<Extract<ChatStreamEvent, { type: 'done' }>> {
+  const response = await fetch(apiContract.chat.stream.path, {
+    method: 'POST',
+    credentials: 'same-origin',
+    signal,
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    let data: unknown;
+    try {
+      data = await response.json();
+    } catch {
+      data = undefined;
+    }
+    throw new ApiError(errorMessage(data, response.status), response.status);
+  }
+  if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body) {
+    await response.body?.cancel();
+    throw new Error('服务未返回流式响应');
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const sse = new SseDecoder();
+  try {
+    while (true) {
+      signal.throwIfAborted();
+      const { value, done } = await reader.read();
+      const text = done ? decoder.decode() : decoder.decode(value, { stream: true });
+      for (const data of sse.push(text)) {
+        signal.throwIfAborted();
+        let event: ChatStreamEvent;
+        try {
+          event = ChatStreamEventSchema.parse(JSON.parse(data));
+        } catch {
+          throw new Error('服务返回了无效的流式数据');
+        }
+        onEvent(event);
+        if (event.type === 'error') throw new ApiError(event.message, event.status, event.debug);
+        if (event.type === 'done') return event;
+      }
+      if (done) throw new Error('连接中断，未收到完整回复');
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
 }

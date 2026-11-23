@@ -5,6 +5,7 @@ import { callModelTurn, toModelMessages } from './model-api';
 import type { ModelMessage, ModelTool } from './model-api';
 import { WebToolsService } from './web-tools.service';
 import type { ChatTrace } from './chat-trace';
+import type { ChatProgress } from './chat-progress';
 
 const tools: ModelTool[] = [
   {
@@ -32,6 +33,7 @@ export class ChatAgentService {
     history: ChatMessage[],
     signal: AbortSignal,
     trace?: ChatTrace,
+    progress?: ChatProgress,
   ): Promise<ChatCompletionResponse> {
     const messages: ModelMessage[] = [
       {
@@ -56,6 +58,7 @@ export class ChatAgentService {
         round === 3 || calls >= 4 ? 'none' : 'auto',
         trace,
         round + 1,
+        progress,
       );
       const thought = turn.reasoning_content?.trim() || turn.reasoning?.trim();
       if (thought) reasoning.push(thought);
@@ -82,14 +85,21 @@ export class ChatAgentService {
       });
       for (const call of turn.tool_calls) {
         const started = Date.now();
-        const result =
-          calls++ < 4
-            ? await this.webTools.execute(call.function.name, call.function.arguments, signal)
-            : {
-                data: { error: '查询次数已达上限，请根据已有数据回答' },
-                sources: [],
-                warning: '联网查询次数已达上限',
-              };
+        const execute = calls++ < 4;
+        if (execute) progress?.toolStart(round + 1, call.id, call.function.name);
+        const result = await (async () => {
+          try {
+            return execute
+              ? await this.webTools.execute(call.function.name, call.function.arguments, signal)
+              : {
+                  data: { error: '查询次数已达上限，请根据已有数据回答' },
+                  sources: [],
+                  warning: '联网查询次数已达上限',
+                };
+          } finally {
+            if (execute) progress?.toolEnd();
+          }
+        })();
         trace?.tool(round + 1, started, call, result);
         if (result.warning) warnings.add(result.warning);
         for (const source of result.sources) {

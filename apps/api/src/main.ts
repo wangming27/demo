@@ -20,7 +20,7 @@ async function bootstrap(): Promise<void> {
   if (environment.trustProxyHops > 0) {
     app.set('trust proxy', environment.trustProxyHops);
   }
-  app.use('/api/chat/completions', json({ limit: '12mb' }));
+  app.use(['/api/chat/completions', '/api/chat/stream'], json({ limit: '12mb' }));
   app.useBodyParser('json', { limit: '16kb' });
   app.useGlobalFilters(new ContractValidationFilter());
   app.enableShutdownHooks();

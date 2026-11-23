@@ -9,6 +9,7 @@ import {
   login,
   logout,
   sendChat,
+  streamChat,
   updateUser,
 } from '../src/services/api.ts';
 
@@ -41,6 +42,117 @@ test('login uses the contract route and strips fields outside the public schema'
     return Promise.resolve(json({ user: { ...user, passwordHash: 'must not reach the screen' } }));
   });
   assert.deepEqual(await login(credentials, controller.signal), user);
+});
+
+const streamInput = { modelId: user.id, messages: [{ role: 'user', content: '流式测试' }] };
+const timing = {
+  elapsedMs: 100,
+  firstResponseMs: 10,
+  phase: 'done',
+  thoughts: [],
+  tools: [],
+};
+const sseFrame = (event) => `data: ${JSON.stringify(event)}\r\n\r\n`;
+test('stream client delivers split UTF8 output before done and releases its reader', async (t) => {
+  let enqueue;
+  let cancelled = false;
+  let partial;
+  const observed = new Promise((resolve) => {
+    partial = resolve;
+  });
+  const stream = new ReadableStream({
+    start(controller) {
+      enqueue = (text) => controller.enqueue(new TextEncoder().encode(text));
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  const signal = new AbortController().signal;
+  t.mock.method(globalThis, 'fetch', async (path, options) => {
+    assert.equal(path, '/api/chat/stream');
+    assert.equal(options.signal, signal);
+    assert.equal(options.credentials, 'same-origin');
+    assert.deepEqual(JSON.parse(options.body), streamInput);
+    return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+  });
+  let settled = false;
+  const events = [];
+  const pending = streamChat(streamInput, signal, (event) => {
+    events.push(event);
+    if (event.type === 'delta') partial();
+  }).then((event) => {
+    settled = true;
+    return event;
+  });
+  enqueue(sseFrame({ type: 'delta', round: 1, reasoning: '思考' }));
+  await observed;
+  assert.equal(settled, false);
+  enqueue(sseFrame({ type: 'done', answer: { content: '回答' }, timing }));
+  assert.equal((await pending).answer.content, '回答');
+  assert.equal(cancelled, true);
+  assert.equal(stream.locked, false);
+  assert.equal(events.length, 2);
+});
+
+test('stream client handles byte fragments, malformed data, truncation, errors and cancellation', async (t) => {
+  for (const [text, expected] of [
+    [
+      sseFrame({ type: 'delta', round: 1, content: '中文' }) +
+        sseFrame({ type: 'done', answer: { content: '中文' }, timing }),
+      '中文',
+    ],
+    [sseFrame({ type: 'delta', round: 1, content: '部分回复' }), null],
+    ['data: {bad}\n\n', null],
+    [sseFrame({ type: 'error', message: '模型失败', status: 502, timing }), 502],
+    [sseFrame({ type: 'state', timing: { ...timing, elapsedMs: -1 } }), null],
+  ]) {
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const byte of new TextEncoder().encode(text)) controller.enqueue(Uint8Array.of(byte));
+        controller.close();
+      },
+    });
+    const mock = t.mock.method(
+      globalThis,
+      'fetch',
+      async () => new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }),
+    );
+    const pending = streamChat(streamInput, new AbortController().signal, () => {});
+    if (expected === '中文') assert.equal((await pending).answer.content, '中文');
+    else
+      await assert.rejects(pending, (error) =>
+        expected === 502
+          ? error instanceof ApiError && error.status === 502
+          : error instanceof Error,
+      );
+    assert.equal(stream.locked, false);
+    mock.mock.restore();
+  }
+  const controller = new AbortController();
+  const stream = new ReadableStream({
+    start(reader) {
+      reader.enqueue(
+        new TextEncoder().encode(sseFrame({ type: 'delta', round: 1, content: '部分回复' })),
+      );
+    },
+  });
+  const mock = t.mock.method(
+    globalThis,
+    'fetch',
+    async () => new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } }),
+  );
+  await assert.rejects(
+    streamChat(streamInput, controller.signal, () => controller.abort()),
+    { name: 'AbortError' },
+  );
+  assert.equal(stream.locked, false);
+  mock.mock.restore();
+  t.mock.method(globalThis, 'fetch', async () => json({ message: '请先登录' }, 401));
+  await assert.rejects(
+    streamChat(streamInput, new AbortController().signal, () => {}),
+    (error) => error instanceof ApiError && error.status === 401,
+  );
 });
 
 test('only the current-user endpoint translates 401 into a signed-out state', async (t) => {

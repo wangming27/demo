@@ -20,6 +20,7 @@ import {
 } from './schemas';
 
 export * from './schemas';
+export * from './sse';
 
 const c = initContract();
 const commonResponses = {
@@ -136,6 +137,17 @@ export const chatContract = c.router(
       body: ChatCompletionSchema,
       responses: {
         200: ChatCompletionResponseSchema,
+        404: ErrorResponseSchema,
+        502: ErrorResponseSchema,
+        504: ErrorResponseSchema,
+      },
+    },
+    stream: {
+      method: 'POST',
+      path: '/chat/stream',
+      body: ChatCompletionSchema,
+      responses: {
+        200: c.otherResponse({ contentType: 'text/event-stream', body: c.type<string>() }),
         404: ErrorResponseSchema,
         502: ErrorResponseSchema,
         504: ErrorResponseSchema,

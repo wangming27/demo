@@ -6,6 +6,7 @@ import { callModel, modelEndpoint } from './model-api';
 import { ChatAgentService } from './chat-agent.service';
 import { ChatTrace } from './chat-trace';
 import { resolveContextWindow } from './model-context';
+import type { ChatProgress } from './chat-progress';
 
 function serialize(model: ChatModel) {
   return {
@@ -71,7 +72,12 @@ export class ChatService {
     if (!result.count) throw new NotFoundException('模型配置不存在');
   }
 
-  async complete(userId: string, input: ChatCompletion, signal: AbortSignal) {
+  async complete(
+    userId: string,
+    input: ChatCompletion,
+    signal: AbortSignal,
+    progress?: ChatProgress,
+  ) {
     const model = await this.prisma.chatModel.findFirst({ where: { id: input.modelId, userId } });
     if (!model) throw new NotFoundException('模型配置不存在，请重新选择');
     const trace = input.debug
@@ -79,8 +85,16 @@ export class ChatService {
       : undefined;
     try {
       const answer = input.webSearch
-        ? await this.agent.complete(model, input.messages, signal, trace)
-        : await callModel(model.baseUrl, model.apiKey, model.model, input.messages, signal, trace);
+        ? await this.agent.complete(model, input.messages, signal, trace, progress)
+        : await callModel(
+            model.baseUrl,
+            model.apiKey,
+            model.model,
+            input.messages,
+            signal,
+            trace,
+            progress,
+          );
       const contextUsage = await resolveContextWindow(model, signal);
       return { ...answer, contextUsage, ...(trace ? { debug: trace.finish('success') } : {}) };
     } catch (error) {

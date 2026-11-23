@@ -7,6 +7,8 @@ import { ChatCompletionResponseSchema } from '@repo/contracts';
 import type { ChatCompletionResponse, ChatMessage } from '@repo/contracts';
 import { z } from 'zod';
 import type { ChatTrace } from './chat-trace';
+import type { ModelObserver } from './chat-progress';
+import { ModelStream } from './model-stream';
 
 const blocked = new BlockList();
 for (const [address, prefix] of [
@@ -129,6 +131,7 @@ export async function callModel(
   messages: ChatMessage[],
   signal: AbortSignal,
   trace?: ChatTrace,
+  observer?: ModelObserver,
 ): Promise<ChatCompletionResponse> {
   const message = await callModelTurn(
     baseUrl,
@@ -139,6 +142,8 @@ export async function callModel(
     undefined,
     'auto',
     trace,
+    1,
+    observer,
   );
   const reasoning = message.reasoning_content?.trim() || message.reasoning?.trim();
   try {
@@ -162,7 +167,9 @@ export async function callModelTurn(
   toolChoice: 'auto' | 'none' = 'auto',
   trace?: ChatTrace,
   round = 1,
+  observer?: ModelObserver,
 ): Promise<ModelTurn> {
+  observer?.modelStart(round);
   const started = trace?.modelRequest(round, messages, tools, toolChoice);
   const url = modelEndpoint(baseUrl);
   const localDevelopment =
@@ -175,7 +182,8 @@ export async function callModelTurn(
   const payload = JSON.stringify({
     model,
     messages,
-    stream: false,
+    stream: Boolean(observer),
+    ...(observer ? { stream_options: { include_usage: true } } : {}),
     ...(tools ? { tools, tool_choice: toolChoice } : {}),
   });
   const hasImages = messages.some(
@@ -228,8 +236,23 @@ export async function callModelTurn(
           return;
         }
         const chunks: Buffer[] = [];
+        const stream = observer ? new ModelStream(round, observer) : undefined;
+        if (stream && !response.headers['content-type']?.includes('text/event-stream')) {
+          response.resume();
+          reject(new BadGatewayException('模型 API 未返回流式响应，请检查服务是否支持 SSE'));
+          return;
+        }
         let bytes = 0;
         response.on('data', (chunk: Buffer) => {
+          if (stream) {
+            try {
+              stream.push(chunk);
+            } catch {
+              reject(new BadGatewayException('模型返回了无效的流式数据'));
+              request.destroy();
+            }
+            return;
+          }
           bytes += chunk.length;
           if (bytes > 1024 * 1024) {
             request.destroy(new Error('Model response too large'));
@@ -240,11 +263,17 @@ export async function callModelTurn(
         response.on('error', () => reject(new BadGatewayException('模型响应中断，请重试')));
         response.on('end', () => {
           try {
-            const body = upstreamSchema.parse(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            const body = upstreamSchema.parse(
+              stream ? stream.finish() : JSON.parse(Buffer.concat(chunks).toString('utf8')),
+            );
             const usage = normalizeUsage(body.usage);
             resolve({ ...body.choices[0]!.message, ...(usage ? { usage } : {}) });
           } catch {
-            reject(new BadGatewayException('模型返回了无法识别的内容'));
+            reject(
+              new BadGatewayException(
+                stream ? '模型流式响应未完整结束或格式无效，请重试' : '模型返回了无法识别的内容',
+              ),
+            );
           }
         });
       },
@@ -258,5 +287,6 @@ export async function callModelTurn(
     request.end(payload);
   });
   if (started !== undefined) trace?.modelResponse(round, started, turn);
+  observer?.modelEnd();
   return turn;
 }

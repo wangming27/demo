@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Avatar, Banner, Button, Select, Spin, Switch } from '@douyinfe/semi-ui';
+import { Avatar, Banner, Button, Select, Spin } from '@douyinfe/semi-ui';
 import { Link } from 'react-router';
 import { ChatCompletionSchema } from '@repo/contracts';
 import type { ChatCompletionResponse, ChatImage } from '@repo/contracts';
-import { ApiError, listChatModels, sendChat } from '../../services/api';
+import { ApiError, listChatModels, streamChat } from '../../services/api';
 import type { ChatMessage, ChatModel, User } from '../../services/api';
 import Icon from '../../components/common/Icon';
 import ModelSettings from '../../components/chat/ModelSettings';
@@ -13,6 +13,8 @@ import ChatDebugPanel from '../../components/chat/ChatDebugPanel';
 import ChatImages, { ImagePreviews } from '../../components/chat/ChatImages';
 import type { DebugRun } from '../../components/chat/ChatDebugPanel';
 import { initialOf } from '../../utils/user-format';
+import ChatTimings from '../../components/chat/ChatTimings';
+import type { DisplayTiming } from '../../components/chat/ChatTimings';
 
 interface Props {
   user: User;
@@ -30,6 +32,9 @@ interface DisplayMessage extends ChatMessage {
   searchWarning?: string;
   usage?: ChatCompletionResponse['usage'];
   contextUsage?: ChatCompletionResponse['contextUsage'];
+  timing?: DisplayTiming;
+  incomplete?: boolean;
+  historyEligible?: boolean;
 }
 
 export default function ChatPage({
@@ -47,17 +52,20 @@ export default function ChatPage({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   const [debugRuns, setDebugRuns] = useState<DebugRun[]>([]);
-  const [webSearch, setWebSearch] = useState(true);
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ChatImage[]>([]);
   const [imagesBusy, setImagesBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [pendingMessage, setPendingMessage] = useState<ChatMessage | null>(null);
+  const [pendingAnswer, setPendingAnswer] = useState<DisplayMessage | null>(null);
+  const answerRef = useRef<DisplayMessage | null>(null);
+  const userMessageRef = useRef<ChatMessage | null>(null);
   const [error, setError] = useState('');
   const requestRef = useRef<AbortController | null>(null);
   const debugRunRef = useRef<string | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const followRef = useRef(true);
   const selected = models.find((model) => model.id === selectedId) ?? models[0];
 
   useEffect(() => {
@@ -84,11 +92,12 @@ export default function ChatPage({
 
   useEffect(() => () => requestRef.current?.abort(), []);
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
-  }, [messages, sending]);
+    if (followRef.current) endRef.current?.scrollIntoView({ block: 'end' });
+  }, [messages, sending, pendingAnswer]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const started = performance.now();
     if (
       requestRef.current ||
       imagesBusy ||
@@ -105,17 +114,19 @@ export default function ChatPage({
       ...(images.length ? { images } : {}),
     };
     const history: ChatMessage[] = [
-      ...messages.map(({ role, content, images }) => ({
-        role,
-        content,
-        ...(images ? { images } : {}),
-      })),
+      ...messages
+        .filter((message) => message.historyEligible !== false)
+        .map(({ role, content, images }) => ({
+          role,
+          content,
+          ...(images ? { images } : {}),
+        })),
       userMessage,
     ];
     const input = ChatCompletionSchema.safeParse({
       modelId: selected.id,
       messages: history,
-      webSearch,
+      webSearch: true,
       debug: true,
     });
     if (!input.success) {
@@ -139,12 +150,56 @@ export default function ChatPage({
       ].slice(-30),
     );
     requestRef.current = controller;
+    followRef.current = true;
+    let currentRound = 1;
+    const partial: DisplayMessage = {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      content: '',
+      modelName: selected.name,
+      timing: {
+        started,
+        received: started,
+        firstResponseMs: null,
+        totalMs: null,
+        server: { elapsedMs: 0, firstResponseMs: null, phase: 'waiting', thoughts: [], tools: [] },
+      },
+    };
+    answerRef.current = partial;
+    userMessageRef.current = userMessage;
+    setPendingAnswer(partial);
     setSending(true);
     setPendingMessage(userMessage);
     setError('');
     try {
-      const answer = await sendChat(input.data, controller.signal);
-      if (!controller.signal.aborted) {
+      const completed = await streamChat(input.data, controller.signal, (event) => {
+        if (controller.signal.aborted || requestRef.current !== controller) return;
+        const current = answerRef.current;
+        if (!current?.timing) return;
+        const now = performance.now();
+        const next = { ...current, timing: { ...current.timing } };
+        if (event.type === 'delta') {
+          if (event.reasoning || event.content || event.toolCall) {
+            next.timing.firstResponseMs ??= now - started;
+          }
+          if (event.round !== currentRound) {
+            next.content = '';
+            if (next.reasoning) next.reasoning += '\n\n';
+            currentRound = event.round;
+          }
+          next.content += event.content ?? '';
+          next.reasoning = (next.reasoning ?? '') + (event.reasoning ?? '');
+        } else {
+          next.timing.server = event.timing;
+          next.timing.received = now;
+          if (event.type === 'done' || event.type === 'error') next.timing.totalMs = now - started;
+        }
+        answerRef.current = next;
+        setPendingAnswer(next);
+      });
+      const answer = completed.answer;
+      const finalTiming = answerRef.current?.timing;
+      if (!controller.signal.aborted && requestRef.current === controller) {
         setDebugRuns((current) =>
           current.map((run) =>
             run.id === debugId
@@ -160,6 +215,7 @@ export default function ChatPage({
             role: 'assistant',
             content: answer.content,
             modelName: selected.name,
+            ...(finalTiming ? { timing: finalTiming } : {}),
             ...(answer.usage ? { usage: answer.usage } : {}),
             ...(answer.contextUsage ? { contextUsage: answer.contextUsage } : {}),
             ...(answer.reasoning ? { reasoning: answer.reasoning } : {}),
@@ -171,7 +227,8 @@ export default function ChatPage({
         setImages([]);
       }
     } catch (error: unknown) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && requestRef.current === controller) {
+        retainIncomplete();
         setDebugRuns((current) =>
           current.map((run) =>
             run.id === debugId
@@ -198,15 +255,59 @@ export default function ChatPage({
       if (requestRef.current === controller) {
         requestRef.current = null;
         debugRunRef.current = null;
-      }
-      if (!controller.signal.aborted) {
         setSending(false);
         setPendingMessage(null);
+        setPendingAnswer(null);
+        answerRef.current = null;
+        userMessageRef.current = null;
       }
     }
   }
 
+  function retainIncomplete() {
+    const answer = answerRef.current;
+    const question = userMessageRef.current;
+    if (!answer || !question) return;
+    const now = performance.now();
+    const timing = answer.timing;
+    const elapsedMs =
+      timing && timing.totalMs === null
+        ? timing.server.elapsedMs + Math.max(0, now - timing.received)
+        : (timing?.server.elapsedMs ?? 0);
+    setMessages((current) => [
+      ...current,
+      { id: crypto.randomUUID(), ...question, historyEligible: false },
+      {
+        ...answer,
+        incomplete: true,
+        historyEligible: false,
+        ...(timing
+          ? {
+              timing: {
+                ...timing,
+                totalMs: timing.totalMs ?? now - timing.started,
+                server: {
+                  ...timing.server,
+                  elapsedMs,
+                  phase: 'done',
+                  thoughts: timing.server.thoughts.map((span) => ({
+                    ...span,
+                    endMs: span.endMs ?? elapsedMs,
+                  })),
+                  tools: timing.server.tools.map((span) => ({
+                    ...span,
+                    endMs: span.endMs ?? elapsedMs,
+                  })),
+                },
+              },
+            }
+          : {}),
+      },
+    ]);
+  }
+
   function stop() {
+    retainIncomplete();
     const debugId = debugRunRef.current;
     setDebugRuns((current) =>
       current.map((run) =>
@@ -220,6 +321,9 @@ export default function ChatPage({
     requestRef.current = null;
     setSending(false);
     setPendingMessage(null);
+    setPendingAnswer(null);
+    answerRef.current = null;
+    userMessageRef.current = null;
   }
 
   return (
@@ -261,42 +365,21 @@ export default function ChatPage({
         </div>
       </header>
       <main className="relative mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col px-4 sm:px-8">
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-line py-5 pr-10">
-          <div>
-            <h1 className="text-xl font-semibold">Chat 对话</h1>
-            <p className="mt-1 text-xs text-muted">选择你的模型，开始一段对话</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Button
-              icon={<Icon name="debug" />}
-              aria-label="打开调试面板"
-              aria-expanded={debugOpen}
-              onClick={() => setDebugOpen(true)}
-            >
-              调试{debugRuns.length ? ` (${debugRuns.length})` : ''}
-            </Button>
-            <Button
-              icon={<Icon name="plus" />}
-              disabled={sending || imagesBusy || messages.length === 0}
-              onClick={() => {
-                setMessages([]);
-                setDraft('');
-                setImages([]);
-                setError('');
-              }}
-            >
-              新对话
-            </Button>
-          </div>
+        <div className="flex shrink-0 items-center justify-end gap-1 py-5">
+          <Button
+            icon={<Icon name="debug" />}
+            aria-label="打开调试面板"
+            aria-expanded={debugOpen}
+            onClick={() => setDebugOpen(true)}
+          />
+          <Button
+            theme="borderless"
+            icon={<Icon name="settings" />}
+            aria-label="打开模型配置"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen(true)}
+          />
         </div>
-        <Button
-          className="absolute right-2 top-5 sm:right-0"
-          theme="borderless"
-          icon={<Icon name="settings" />}
-          aria-label="打开模型配置"
-          aria-expanded={settingsOpen}
-          onClick={() => setSettingsOpen(true)}
-        />
         {(sessionError || loadError) && (
           <div role="alert" className="mt-4">
             <Banner type="danger" description={sessionError || loadError} closeIcon={null} />
@@ -320,6 +403,11 @@ export default function ChatPage({
           aria-label="对话记录"
           aria-live="polite"
           aria-busy={sending}
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            followRef.current =
+              element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+          }}
         >
           {loading ? (
             <div className="flex h-full items-center justify-center">
@@ -330,24 +418,11 @@ export default function ChatPage({
               <span className="mb-5 rounded-2xl bg-indigo-50 p-4 text-indigo-500">
                 <Icon name="chat" />
               </span>
-              <h2 className="text-2xl font-semibold">
-                {models.length ? `你好，${user.name}` : '添加你的第一个模型'}
-              </h2>
-              <p className="mt-3 max-w-md text-sm leading-6 text-muted">
+              <p className="max-w-md text-sm leading-6 text-muted">
                 {models.length
                   ? '提一个问题、梳理一个想法，或让 AI 帮你完成一项工作。'
                   : '点击右侧配置图标，填写模型 API 地址和密钥，保存后即可开始对话。'}
               </p>
-              {!models.length && !loadError && (
-                <Button
-                  className="mt-6"
-                  theme="solid"
-                  icon={<Icon name="settings" />}
-                  onClick={() => setSettingsOpen(true)}
-                >
-                  配置模型
-                </Button>
-              )}
             </div>
           ) : (
             <div className="space-y-6">
@@ -357,10 +432,7 @@ export default function ChatPage({
               {sending && pendingMessage && (
                 <>
                   <Message message={{ id: 'pending', ...pendingMessage }} userName={user.name} />
-                  <div className="flex items-center gap-3 text-sm text-muted">
-                    <Spin size="small" />
-                    {selected?.name} {webSearch ? '正在思考并按需查询网络…' : '正在思考…'}
-                  </div>
+                  {pendingAnswer && <Message message={pendingAnswer} userName={user.name} />}
                 </>
               )}
               <div ref={endRef} />
@@ -395,14 +467,6 @@ export default function ChatPage({
                   }}
                 />
               </div>
-              <Button
-                theme="borderless"
-                size="small"
-                icon={<Icon name="settings" />}
-                onClick={() => setSettingsOpen(true)}
-              >
-                模型配置
-              </Button>
             </div>
             <textarea
               aria-label="消息内容"
@@ -428,23 +492,7 @@ export default function ChatPage({
               onChange={setImages}
               onError={setError}
               onBusyChange={setImagesBusy}
-            />
-            <div className="mt-3 flex items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-3">
-                <label className="flex items-center gap-2 text-xs text-muted">
-                  <Switch
-                    aria-label="联网搜索"
-                    checked={webSearch}
-                    onChange={setWebSearch}
-                    disabled={sending}
-                    size="small"
-                  />
-                  联网搜索
-                </label>
-                <span className="hidden text-xs text-muted sm:inline">
-                  Enter 发送 · Shift + Enter 换行
-                </span>
-              </div>
+            >
               {sending ? (
                 <Button onClick={stop}>停止生成</Button>
               ) : (
@@ -452,6 +500,7 @@ export default function ChatPage({
                   htmlType="submit"
                   theme="solid"
                   icon={<Icon name="arrow-right" />}
+                  aria-label="发送"
                   disabled={
                     loading ||
                     imagesBusy ||
@@ -459,11 +508,9 @@ export default function ChatPage({
                     !selected ||
                     (!draft.trim() && !images.length)
                   }
-                >
-                  发送
-                </Button>
+                />
               )}
-            </div>
+            </ChatImages>
           </form>
           <p className="mt-3 text-center text-xs text-muted">
             对话仅保留在当前页面。AI 回复请自行核实。
@@ -538,7 +585,15 @@ function Message({ message, userName }: { message: DisplayMessage; userName: str
             </ol>
           </div>
         )}
-        {!own && <ContextUsage usage={message.usage} contextUsage={message.contextUsage} />}
+        {!own && !message.incomplete && (!message.timing || message.timing.totalMs !== null) && (
+          <ContextUsage usage={message.usage} contextUsage={message.contextUsage} />
+        )}
+        {!own && message.incomplete && (
+          <p className="mt-3 text-xs text-amber-700">
+            回复未完成（已停止或连接中断），可重新发送。
+          </p>
+        )}
+        {!own && message.timing && <ChatTimings timing={message.timing} />}
       </div>
     </article>
   );
