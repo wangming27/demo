@@ -6,6 +6,7 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { getEnvironment } from './config/environment';
 import { ContractValidationFilter } from './contracts/validation.filter';
+import { json } from 'express';
 
 async function bootstrap(): Promise<void> {
   const environment = getEnvironment();
@@ -19,6 +20,7 @@ async function bootstrap(): Promise<void> {
   if (environment.trustProxyHops > 0) {
     app.set('trust proxy', environment.trustProxyHops);
   }
+  app.use('/api/chat/completions', json({ limit: '12mb' }));
   app.useBodyParser('json', { limit: '16kb' });
   app.useGlobalFilters(new ContractValidationFilter());
   app.enableShutdownHooks();

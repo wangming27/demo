@@ -11,6 +11,12 @@ import {
   UserIdParamsSchema,
   UserListSchema,
   UserResponseSchema,
+  ChatCompletionSchema,
+  ChatCompletionResponseSchema,
+  ChatModelResponseSchema,
+  ChatModelsResponseSchema,
+  CreateChatModelSchema,
+  UpdateChatModelSchema,
 } from './schemas';
 
 export * from './schemas';
@@ -97,8 +103,50 @@ export const healthContract = c.router(
   },
   { pathPrefix: '/api', commonResponses, strictStatusCodes: true },
 );
+export const chatContract = c.router(
+  {
+    listModels: {
+      method: 'GET',
+      path: '/chat/models',
+      responses: { 200: ChatModelsResponseSchema },
+    },
+    createModel: {
+      method: 'POST',
+      path: '/chat/models',
+      body: CreateChatModelSchema,
+      responses: { 201: ChatModelResponseSchema },
+    },
+    updateModel: {
+      method: 'PATCH',
+      path: '/chat/models/:id',
+      pathParams: UserIdParamsSchema,
+      body: UpdateChatModelSchema,
+      responses: { 200: ChatModelResponseSchema, 404: ErrorResponseSchema },
+    },
+    deleteModel: {
+      method: 'DELETE',
+      path: '/chat/models/:id',
+      pathParams: UserIdParamsSchema,
+      body: c.noBody(),
+      responses: { 204: c.noBody(), 404: ErrorResponseSchema },
+    },
+    complete: {
+      method: 'POST',
+      path: '/chat/completions',
+      body: ChatCompletionSchema,
+      responses: {
+        200: ChatCompletionResponseSchema,
+        404: ErrorResponseSchema,
+        502: ErrorResponseSchema,
+        504: ErrorResponseSchema,
+      },
+    },
+  },
+  { pathPrefix: '/api', commonResponses, strictStatusCodes: true },
+);
 export const apiContract = c.router({
   auth: authContract,
   users: usersContract,
   health: healthContract,
+  chat: chatContract,
 });

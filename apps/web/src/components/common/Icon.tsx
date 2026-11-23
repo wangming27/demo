@@ -14,7 +14,13 @@ type IconName =
   | 'calendar'
   | 'check'
   | 'menu'
-  | 'close';
+  | 'close'
+  | 'chat'
+  | 'settings'
+  | 'plus'
+  | 'trash'
+  | 'image'
+  | 'debug';
 
 const paths: Record<IconName, string[]> = {
   layers: ['m12 3 9 5-9 5-9-5 9-5Z', 'm3 12 9 5 9-5', 'm3 16 9 5 9-5'],
@@ -43,6 +49,25 @@ const paths: Record<IconName, string[]> = {
   check: ['m5 12 4 4L19 6'],
   menu: ['M3 6h18', 'M3 12h18', 'M3 18h18'],
   close: ['m6 6 12 12', 'm18 6-12 12'],
+  chat: ['M21 11.5a8.5 8.5 0 0 1-8.5 8.5H4l-3 3V11.5a10 10 0 0 1 20 0Z', 'M7 10h10', 'M7 14h6'],
+  settings: [
+    'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z',
+    'm9 3-1 3-3 1-2 5 2 5 3 1 1 3h6l1-3 3-1 2-5-2-5-3-1-1-3Z',
+  ],
+  plus: ['M12 5v14', 'M5 12h14'],
+  trash: ['M3 6h18', 'M9 6V3h6v3', 'M5 6l1 15h12l1-15', 'M10 10v7', 'M14 10v7'],
+  image: ['M3 3h18v18H3z', 'm3 17 6-6 4 4 3-3 5 5', 'M15 8h.01'],
+  debug: [
+    'M8 9h8v9a4 4 0 0 1-8 0V9Z',
+    'M9 9V7a3 3 0 0 1 6 0v2',
+    'M12 9v13',
+    'M4 10h4',
+    'M16 10h4',
+    'M4 15h4',
+    'M16 15h4',
+    'm5 21 3-3',
+    'm16 18 3 3',
+  ],
 };
 
 export default function Icon({ name, className = '' }: { name: IconName; className?: string }) {

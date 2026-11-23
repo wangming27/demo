@@ -53,12 +53,13 @@ export default function UsersPage({
         <Nav
           className="w-full border-0 bg-transparent"
           selectedKeys={['users']}
-          onSelect={() => {
+          onSelect={({ itemKey }) => {
             setMenuOpen(false);
-            void navigate('/users');
+            void navigate(itemKey === 'chat' ? '/chat' : '/users');
           }}
         >
           <Nav.Item itemKey="users" text="用户管理" icon={<Icon name="users" />} />
+          <Nav.Item itemKey="chat" text="Chat 对话" icon={<Icon name="chat" />} />
         </Nav>
       </nav>
       <div className="mt-auto border-t border-line pt-6 text-xs leading-6 text-muted">

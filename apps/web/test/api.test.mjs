@@ -8,6 +8,7 @@ import {
   listUsers,
   login,
   logout,
+  sendChat,
   updateUser,
 } from '../src/services/api.ts';
 
@@ -153,6 +154,37 @@ test('logout accepts an empty 204 response and health uses the shared schema', a
   assert.deepEqual(await getHealth(signal), health);
 });
 
+test('chat preserves reasoning separately and still accepts answers without it', async (t) => {
+  const signal = new AbortController().signal;
+  const input = {
+    modelId: user.id,
+    messages: [{ role: 'user', content: '请回答' }],
+    webSearch: true,
+  };
+  for (const response of [
+    { content: '最终回答', reasoning: '第一步。\n第二步。' },
+    { content: '普通回答' },
+    {
+      content: '联网回答',
+      reasoning: '搜索资料',
+      sources: [{ title: '来源', url: 'https://example.com' }],
+      searchWarning: '部分查询失败',
+    },
+  ]) {
+    const mock = t.mock.method(globalThis, 'fetch', (path, options) => {
+      assert.equal(path, '/api/chat/completions');
+      assert.deepEqual(JSON.parse(options.body), input);
+      return Promise.resolve(json(response));
+    });
+    assert.deepEqual(await sendChat(input, signal), response);
+    mock.mock.restore();
+  }
+  t.mock.method(globalThis, 'fetch', () =>
+    Promise.resolve(json({ content: '回答', reasoning: 42 })),
+  );
+  await assert.rejects(sendChat(input, signal), { message: '服务返回了无法识别的数据' });
+});
+
 test('request cancellation propagates the AbortError', async (t) => {
   const controller = new AbortController();
   controller.abort();
@@ -161,4 +193,68 @@ test('request cancellation propagates the AbortError', async (t) => {
     return Promise.reject(options.signal.reason);
   });
   await assert.rejects(getCurrentUser(controller.signal), { name: 'AbortError' });
+});
+
+test('chat client preserves image data and image-only messages in the request', async (t) => {
+  const input = {
+    modelId: user.id,
+    messages: [
+      {
+        role: 'user',
+        content: '',
+        images: [
+          {
+            name: 'pixel.png',
+            dataUrl:
+              'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+          },
+        ],
+      },
+    ],
+    webSearch: true,
+    debug: true,
+  };
+  t.mock.method(globalThis, 'fetch', (_path, options) => {
+    assert.deepEqual(JSON.parse(options.body), input);
+    return Promise.resolve(json({ content: '图片回答' }));
+  });
+  assert.equal((await sendChat(input, new AbortController().signal)).content, '图片回答');
+});
+
+test('chat preserves debug records on success and on upstream failure', async (t) => {
+  const input = { modelId: user.id, messages: [{ role: 'user', content: '调试' }], debug: true };
+  const debug = {
+    requestId: user.id,
+    startedAt: user.createdAt,
+    durationMs: 10,
+    status: 'success',
+    model: { name: '测试模型', model: 'test', baseUrl: 'https://example.com/v1' },
+    events: [
+      {
+        kind: 'model_request',
+        round: 1,
+        startedAt: user.createdAt,
+        durationMs: 0,
+        truncated: false,
+        messages: input.messages,
+        tools: '[]',
+      },
+    ],
+  };
+  const success = t.mock.method(globalThis, 'fetch', (_path, options) => {
+    assert.deepEqual(JSON.parse(options.body), input);
+    return Promise.resolve(json({ content: '回答', debug }));
+  });
+  assert.deepEqual((await sendChat(input, new AbortController().signal)).debug, debug);
+  success.mock.restore();
+  const failed = { ...debug, status: 'error' };
+  t.mock.method(globalThis, 'fetch', () =>
+    Promise.resolve(json({ message: '模型 API 鉴权失败', debug: failed }, 502)),
+  );
+  await assert.rejects(sendChat(input, new AbortController().signal), (error) => {
+    assert.equal(error instanceof ApiError, true);
+    assert.equal(error.status, 502);
+    assert.deepEqual(error.debug, failed);
+    return true;
+  });
 });

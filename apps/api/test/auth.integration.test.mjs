@@ -4,6 +4,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer } from 'node:http';
 import { resolve } from 'node:path';
 import { after, before, test } from 'node:test';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -660,6 +661,380 @@ test('administrator user management', async (t) => {
       ),
     );
     assert.equal(await prisma.user.count({ where: { role: 'ADMIN', status: 'ACTIVE' } }), 1);
+  });
+});
+
+test('chat configuration ownership and model proxy', async (t) => {
+  const { createToken } = require('../.test-dist/auth/session.js');
+  async function fixtureCookie(id) {
+    const value = `demo_session=${createToken()}`;
+    await prisma.session.create({
+      data: { userId: id, tokenHash: tokenHash(value), expiresAt: new Date(Date.now() + 60_000) },
+    });
+    return value;
+  }
+  const ownerCookie = await fixtureCookie(userId);
+  const other = await prisma.user.create({
+    data: {
+      name: 'Chat other',
+      email: `chat-${randomUUID()}@example.com`,
+      passwordHash: (await prisma.user.findUniqueOrThrow({ where: { id: userId } })).passwordHash,
+    },
+  });
+  const otherCookie = await fixtureCookie(other.id);
+  let upstreamStatus = 200;
+  let upstreamBody = { choices: [{ message: { content: '模型回复：你好' } }] };
+  let received;
+  const upstream = createHttpServer(async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    received = {
+      path: request.url,
+      authorization: request.headers.authorization,
+      body: JSON.parse(body),
+    };
+    response.writeHead(upstreamStatus, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(upstreamBody));
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(
+    () =>
+      new Promise((resolve, reject) =>
+        upstream.close((error) => (error ? reject(error) : resolve())),
+      ),
+  );
+  const address = upstream.address();
+  assert.ok(address && typeof address !== 'string');
+  const input = {
+    name: '测试模型',
+    model: 'test-model',
+    baseUrl: `http://127.0.0.1:${address.port}/v1/`,
+    apiKey: 'sk-test-private',
+  };
+  async function chat(
+    path,
+    method = 'GET',
+    body,
+    currentCookie = ownerCookie,
+    requestOrigin = origin,
+  ) {
+    return fetch(`${baseUrl}/api/chat${path}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(currentCookie ? { Cookie: currentCookie } : {}),
+        ...(requestOrigin ? { Origin: requestOrigin } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+  }
+  let first;
+  let second;
+
+  await t.test('requires session and trusted origin, validates configuration', async () => {
+    assert.equal((await chat('/models', 'GET', undefined, '')).status, 401);
+    assert.equal((await chat('/models', 'POST', { ...input, baseUrl: 'invalid' })).status, 400);
+    assert.equal((await chat('/models', 'POST', input, ownerCookie, '')).status, 403);
+    assert.equal(
+      (await chat('/models', 'POST', { ...input, baseUrl: 'http://example.com' })).status,
+      400,
+    );
+    assert.equal((await chat('/models', 'POST', { ...input, apiKey: 'bad\nkey' })).status, 400);
+    assert.equal(
+      (await chat('/models', 'POST', { ...input, baseUrl: 'https://user:pass@example.com' }))
+        .status,
+      400,
+    );
+  });
+  await t.test('persists ordered models and never returns API keys', async () => {
+    const response = await chat('/models', 'POST', input);
+    assert.equal(response.status, 201);
+    first = (await response.json()).model;
+    assert.equal(first.hasApiKey, true);
+    assert.equal('apiKey' in first, false);
+    const next = await chat('/models', 'POST', {
+      ...input,
+      name: '第二模型',
+      model: 'second-model',
+    });
+    assert.equal(next.status, 201);
+    second = (await next.json()).model;
+    const listed = await (await chat('/models')).json();
+    assert.deepEqual(
+      listed.items.map(({ id }) => id),
+      [first.id, second.id],
+    );
+    assert.equal(JSON.stringify(listed).includes(input.apiKey), false);
+    assert.equal(
+      (await prisma.chatModel.findUniqueOrThrow({ where: { id: first.id } })).apiKey,
+      input.apiKey,
+    );
+  });
+  await t.test('another user cannot read, edit, delete or use the configuration', async () => {
+    assert.deepEqual(await (await chat('/models', 'GET', undefined, otherCookie)).json(), {
+      items: [],
+    });
+    assert.equal((await chat(`/models/${first.id}`, 'PATCH', input, otherCookie)).status, 404);
+    assert.equal((await chat(`/models/${first.id}`, 'DELETE', undefined, otherCookie)).status, 404);
+    assert.equal(
+      (
+        await chat(
+          '/completions',
+          'POST',
+          { modelId: first.id, messages: [{ role: 'user', content: '你好' }] },
+          otherCookie,
+        )
+      ).status,
+      404,
+    );
+  });
+  await t.test('editing preserves an omitted key and supports replacing it', async () => {
+    const { apiKey, ...fields } = input;
+    assert.ok(apiKey);
+    const response = await chat(`/models/${first.id}`, 'PATCH', { ...fields, name: '更新名称' });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).model.name, '更新名称');
+    assert.equal(
+      (await prisma.chatModel.findUniqueOrThrow({ where: { id: first.id } })).apiKey,
+      input.apiKey,
+    );
+    assert.equal(
+      (await chat(`/models/${first.id}`, 'PATCH', { ...fields, apiKey: 'sk-replaced' })).status,
+      200,
+    );
+  });
+  await t.test('forwards selected model and multi-turn history using the server key', async () => {
+    const messages = [
+      { role: 'user', content: '第一条' },
+      { role: 'assistant', content: '第一条回复' },
+      { role: 'user', content: '请继续' },
+    ];
+    const response = await chat('/completions', 'POST', { modelId: first.id, messages });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      content: '模型回复：你好',
+      contextUsage: { windowTokens: null, source: 'unknown' },
+    });
+    assert.deepEqual(received, {
+      path: '/v1/chat/completions',
+      authorization: 'Bearer sk-replaced',
+      body: { model: input.model, messages, stream: false },
+    });
+    const large = await chat('/completions', 'POST', {
+      modelId: second.id,
+      messages: [{ role: 'user', content: '中'.repeat(10_000) }],
+    });
+    assert.equal(large.status, 200);
+    assert.equal(received.body.model, 'second-model');
+    assert.equal(received.authorization, 'Bearer sk-test-private');
+  });
+  await t.test('debug records actual plain model history without credentials', async () => {
+    const messages = [{ role: 'user', content: '请展示调用记录' }];
+    const response = await chat('/completions', 'POST', {
+      modelId: first.id,
+      messages,
+      debug: true,
+    });
+    assert.equal(response.status, 200);
+    const { debug } = await response.json();
+    assert.equal(debug.status, 'success');
+    assert.deepEqual(
+      debug.events.map((event) => event.kind),
+      ['model_request', 'model_response'],
+    );
+    assert.deepEqual(debug.events[0].messages, messages);
+    assert.equal(debug.events[0].tools, '[]');
+    assert.equal(debug.events[0].toolChoice, undefined);
+    assert.equal(JSON.parse(debug.events[1].message).content, '模型回复：你好');
+    assert.equal(JSON.stringify(debug).includes('sk-replaced'), false);
+    assert.equal('apiKey' in debug.model, false);
+    assert.equal('debug' in received.body, false);
+  });
+  await t.test(
+    'configured window persists, can be cleared, and accompanies reported usage',
+    async () => {
+      const { apiKey, ...fields } = input;
+      assert.ok(apiKey);
+      const saved = await chat(`/models/${first.id}`, 'PATCH', {
+        ...fields,
+        contextWindow: 32768,
+      });
+      assert.equal(saved.status, 200);
+      assert.equal((await saved.json()).model.contextWindow, 32768);
+      assert.equal(
+        (await prisma.chatModel.findUniqueOrThrow({ where: { id: first.id } })).contextWindow,
+        32768,
+      );
+      await chat(`/models/${first.id}`, 'PATCH', fields);
+      assert.equal((await (await chat('/models')).json()).items[0].contextWindow, 32768);
+      const previous = upstreamBody;
+      upstreamBody = {
+        choices: [{ message: { content: '用量回答' } }],
+        usage: { prompt_tokens: 1500, completion_tokens: 200, total_tokens: 1700 },
+      };
+      const answer = await chat('/completions', 'POST', {
+        modelId: first.id,
+        messages: [{ role: 'user', content: '用量' }],
+      });
+      assert.deepEqual(await answer.json(), {
+        content: '用量回答',
+        usage: { inputTokens: 1500, outputTokens: 200 },
+        contextUsage: { windowTokens: 32768, source: 'configured' },
+      });
+      upstreamBody = previous;
+      const cleared = await chat(`/models/${first.id}`, 'PATCH', {
+        ...fields,
+        contextWindow: null,
+      });
+      assert.equal((await cleared.json()).model.contextWindow, null);
+    },
+  );
+  await t.test(
+    'image requests cross HTTP validation and reach the selected model as image parts',
+    async () => {
+      const image = {
+        name: 'pixel.png',
+        dataUrl:
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+      };
+      const response = await chat('/completions', 'POST', {
+        modelId: first.id,
+        messages: [{ role: 'user', content: '', images: [image] }],
+        debug: true,
+      });
+      assert.equal(response.status, 200);
+      const answer = await response.json();
+      assert.deepEqual(received.body.messages, [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '请描述这张图片的内容。' },
+            { type: 'image_url', image_url: { url: image.dataUrl } },
+          ],
+        },
+      ]);
+      assert.equal(received.body.model, input.model);
+      assert.equal(JSON.stringify(answer.debug).includes(image.dataUrl), false);
+      assert.match(answer.debug.events[0].messages[0].content, /图片数据已省略/);
+      // Exercise a payload above the old 256 KB chat parser limit.
+      const largeImage = {
+        ...image,
+        dataUrl: `data:image/png;base64,${Buffer.concat([
+          Buffer.from(image.dataUrl.split(',')[1], 'base64'),
+          Buffer.alloc(300 * 1024),
+        ]).toString('base64')}`,
+      };
+      const large = await chat('/completions', 'POST', {
+        modelId: first.id,
+        messages: [{ role: 'user', content: '图片请求大小验证', images: [largeImage] }],
+      });
+      assert.equal(large.status, 200);
+      assert.equal(received.body.messages[0].content[1].image_url.url, largeImage.dataUrl);
+    },
+  );
+  await t.test('failed model requests retain debug history and original error status', async () => {
+    upstreamStatus = 401;
+    const response = await chat('/completions', 'POST', {
+      modelId: first.id,
+      messages: [{ role: 'user', content: '检查失败记录' }],
+      debug: true,
+    });
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.match(body.message, /鉴权失败/);
+    assert.equal(body.debug.status, 'error');
+    assert.deepEqual(
+      body.debug.events.map((event) => event.kind),
+      ['model_request', 'error'],
+    );
+    assert.equal(body.debug.events[0].messages[0].content, '检查失败记录');
+    assert.equal(JSON.stringify(body).includes('sk-replaced'), false);
+    upstreamStatus = 200;
+  });
+  await t.test('returns reasoning separately and tolerates absent or empty reasoning', async () => {
+    for (const [fields, expected] of [
+      [
+        { reasoning_content: '先理解问题。\n再组织答案。', reasoning: '备用字段' },
+        { reasoning: '先理解问题。\n再组织答案。' },
+      ],
+      [{ reasoning: '兼容服务的思考文本' }, { reasoning: '兼容服务的思考文本' }],
+      [{ reasoning_content: null, reasoning: null }, {}],
+      [{ reasoning_content: ' \n ', reasoning: '' }, {}],
+      [{}, {}],
+    ]) {
+      upstreamBody = { choices: [{ message: { content: '最终回答', ...fields } }] };
+      const response = await chat('/completions', 'POST', {
+        modelId: first.id,
+        messages: [{ role: 'user', content: '请回答' }],
+      });
+      assert.equal(response.status, 200);
+      assert.deepEqual(await response.json(), {
+        content: '最终回答',
+        contextUsage: { windowTokens: null, source: 'unknown' },
+        ...expected,
+      });
+    }
+  });
+  await t.test(
+    'validates history and handles upstream errors without exposing secrets',
+    async () => {
+      assert.equal(
+        (await chat('/completions', 'POST', { modelId: first.id, messages: [] })).status,
+        400,
+      );
+      assert.equal(
+        (
+          await chat('/completions', 'POST', {
+            modelId: first.id,
+            messages: [{ role: 'system', content: 'x' }],
+          })
+        ).status,
+        400,
+      );
+      assert.equal(
+        (
+          await chat('/completions', 'POST', {
+            modelId: first.id,
+            messages: [{ role: 'assistant', content: 'x' }],
+          })
+        ).status,
+        400,
+      );
+      upstreamStatus = 401;
+      const denied = await chat('/completions', 'POST', {
+        modelId: first.id,
+        messages: [{ role: 'user', content: 'x' }],
+      });
+      assert.equal(denied.status, 502);
+      assert.equal((await denied.json()).message.includes('鉴权失败'), true);
+      upstreamStatus = 200;
+      upstreamBody = { choices: [] };
+      const malformed = await chat('/completions', 'POST', {
+        modelId: first.id,
+        messages: [{ role: 'user', content: 'x' }],
+      });
+      assert.equal(malformed.status, 502);
+      const privateConfig = await chat('/models', 'POST', {
+        ...input,
+        baseUrl: 'https://169.254.169.254',
+      });
+      const privateModel = (await privateConfig.json()).model;
+      assert.equal(
+        (
+          await chat('/completions', 'POST', {
+            modelId: privateModel.id,
+            messages: [{ role: 'user', content: 'x' }],
+          })
+        ).status,
+        400,
+      );
+    },
+  );
+  await t.test('deleting the first model leaves the next model first', async () => {
+    assert.equal((await chat(`/models/${first.id}`, 'DELETE')).status, 204);
+    const list = await (await chat('/models')).json();
+    assert.equal(list.items[0].id, second.id);
+    assert.equal((await chat(`/models/${first.id}`, 'DELETE')).status, 404);
   });
 });
 

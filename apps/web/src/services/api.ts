@@ -1,4 +1,4 @@
-import { apiContract } from '@repo/contracts';
+import { apiContract, ChatDebugTraceSchema } from '@repo/contracts';
 import type {
   Credentials,
   HealthResponse,
@@ -8,6 +8,12 @@ import type {
   Registration,
   UserList,
   UserUpdate,
+  ChatModel,
+  CreateChatModel,
+  UpdateChatModel,
+  ChatCompletion,
+  ChatCompletionResponse,
+  ChatDebugTrace,
 } from '@repo/contracts';
 import { initClient, ResponseValidationError, validateResponse } from '@ts-rest/core';
 
@@ -20,6 +26,10 @@ export type {
   Registration,
   UserList,
   UserUpdate,
+  ChatModel,
+  CreateChatModel,
+  UpdateChatModel,
+  ChatMessage,
 } from '@repo/contracts';
 
 // Empty selection belongs to the screen; the HTTP contract uses an omitted status.
@@ -32,6 +42,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly debug?: ChatDebugTrace,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -40,7 +51,7 @@ export class ApiError extends Error {
 
 function errorMessage(value: unknown, status: number): string {
   if (status === 429) return '操作太频繁，请稍后重试';
-  if (status >= 500) return '服务暂时不可用，请稍后重试';
+  if (status >= 500 && status !== 502 && status !== 504) return '服务暂时不可用，请稍后重试';
   if (typeof value === 'object' && value !== null && 'message' in value) {
     const message: unknown = value.message;
     if (typeof message === 'string') return message;
@@ -48,7 +59,7 @@ function errorMessage(value: unknown, status: number): string {
       return message.join('；');
     }
   }
-  return `服务请求失败（HTTP ${status}）`;
+  return status >= 500 ? '服务暂时不可用，请稍后重试' : `服务请求失败（HTTP ${status}）`;
 }
 
 const client = initClient(apiContract, {
@@ -75,7 +86,14 @@ const client = initClient(apiContract, {
       }
     }
     if (!response.ok) {
-      throw new ApiError(errorMessage(data, response.status), response.status);
+      const debug = ChatDebugTraceSchema.safeParse(
+        typeof data === 'object' && data !== null && 'debug' in data ? data.debug : undefined,
+      );
+      throw new ApiError(
+        errorMessage(data, response.status),
+        response.status,
+        debug.success ? debug.data : undefined,
+      );
     }
     const validated = validateResponse({
       appRoute: args.route,
@@ -175,6 +193,49 @@ export async function logout(signal: AbortSignal): Promise<void> {
 
 export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   const result = await request(client.health.get({ fetchOptions: signal ? { signal } : {} }));
+  assertStatus(result, 200);
+  return result.body;
+}
+
+export async function listChatModels(signal: AbortSignal): Promise<ChatModel[]> {
+  const result = await request(client.chat.listModels({ fetchOptions: { signal } }));
+  assertStatus(result, 200);
+  return result.body.items;
+}
+
+export async function createChatModel(
+  input: CreateChatModel,
+  signal: AbortSignal,
+): Promise<ChatModel> {
+  const result = await request(client.chat.createModel({ body: input, fetchOptions: { signal } }));
+  assertStatus(result, 201);
+  return result.body.model;
+}
+
+export async function updateChatModel(
+  id: string,
+  input: UpdateChatModel,
+  signal: AbortSignal,
+): Promise<ChatModel> {
+  const result = await request(
+    client.chat.updateModel({ params: { id }, body: input, fetchOptions: { signal } }),
+  );
+  assertStatus(result, 200);
+  return result.body.model;
+}
+
+export async function deleteChatModel(id: string, signal: AbortSignal): Promise<void> {
+  const result = await request(
+    client.chat.deleteModel({ params: { id }, fetchOptions: { signal } }),
+  );
+  assertStatus(result, 204);
+}
+
+export async function sendChat(
+  input: ChatCompletion,
+  signal: AbortSignal,
+): Promise<ChatCompletionResponse> {
+  const result = await request(client.chat.complete({ body: input, fetchOptions: { signal } }));
   assertStatus(result, 200);
   return result.body;
 }

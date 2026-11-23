@@ -4,6 +4,7 @@ import useSession from './hooks/useSession';
 import LoginPage from './pages/login/LoginPage';
 import NotFoundPage from './pages/not-found/NotFoundPage';
 import UsersPage from './pages/users/UsersPage';
+import ChatPage from './pages/chat/ChatPage';
 
 export default function App() {
   const account = useSession();
@@ -48,6 +49,22 @@ export default function App() {
         }
       />
       <Route path="*" element={<NotFoundPage />} />
+      <Route
+        path="/chat"
+        element={
+          session.status === 'authenticated' ? (
+            <ChatPage
+              user={session.user}
+              pending={account.pending}
+              sessionError={account.error}
+              onLogout={account.logout}
+              onSessionExpired={account.sessionExpired}
+            />
+          ) : (
+            <Navigate to="/login" replace />
+          )
+        }
+      />
     </Routes>
   );
 }

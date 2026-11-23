@@ -77,11 +77,211 @@ export const HealthResponseSchema = z.object({
   service: z.string(),
   timestamp,
 });
+const debugToolCall = z.object({
+  id: z.string(),
+  name: z.string(),
+  arguments: z.string(),
+});
+const debugMessage = z.object({
+  role: z.enum(['system', 'user', 'assistant', 'tool']),
+  content: z.string().nullable(),
+  reasoning: z.string().optional(),
+  toolCallId: z.string().optional(),
+  toolCalls: z.array(debugToolCall).optional(),
+});
+const debugEventFields = {
+  round: z.number().int().min(1).max(4),
+  startedAt: timestamp,
+  durationMs: z.number().nonnegative(),
+  truncated: z.boolean(),
+};
+export const ChatDebugEventSchema = z.discriminatedUnion('kind', [
+  z.object({
+    ...debugEventFields,
+    kind: z.literal('model_request'),
+    messages: z.array(debugMessage),
+    tools: z.string(),
+    toolChoice: z.enum(['auto', 'none']).optional(),
+  }),
+  z.object({ ...debugEventFields, kind: z.literal('model_response'), message: z.string() }),
+  z.object({
+    ...debugEventFields,
+    kind: z.literal('tool'),
+    toolCallId: z.string(),
+    name: z.string(),
+    arguments: z.string(),
+    result: z.string(),
+    warning: z.string().optional(),
+  }),
+  z.object({ ...debugEventFields, kind: z.literal('error'), message: z.string() }),
+]);
+export const ChatDebugTraceSchema = z.object({
+  requestId: z.string().uuid(),
+  startedAt: timestamp,
+  durationMs: z.number().nonnegative(),
+  status: z.enum(['success', 'error']),
+  model: z.object({ name: z.string(), model: z.string(), baseUrl: z.string() }),
+  events: z.array(ChatDebugEventSchema).max(32),
+});
+export type ChatDebugTrace = z.output<typeof ChatDebugTraceSchema>;
+export type ChatDebugEvent = z.output<typeof ChatDebugEventSchema>;
 export const ErrorResponseSchema = z.object({
   message: z.union([z.string(), z.array(z.string())]),
   statusCode: z.number().int().optional(),
   error: z.string().optional(),
+  debug: ChatDebugTraceSchema.optional(),
 });
+
+const modelFields = {
+  contextWindow: z.number().int().min(1).max(2_147_483_647).nullable().optional(),
+  name: z.string().trim().min(1).max(80),
+  model: z.string().trim().min(1).max(200),
+  baseUrl: z
+    .string()
+    .trim()
+    .url('请输入有效的 API 地址')
+    .max(2048)
+    .refine((value) => {
+      try {
+        const url = new URL(value);
+        return (
+          ['https:', 'http:'].includes(url.protocol) &&
+          !url.username &&
+          !url.password &&
+          !url.search &&
+          !url.hash
+        );
+      } catch {
+        return false;
+      }
+    }, 'API 地址必须使用 HTTP(S)，且不能包含账号、查询参数或片段'),
+};
+const apiKey = z
+  .string()
+  .trim()
+  .min(1)
+  .max(4096)
+  .regex(/^[\x21-\x7e]+$/, 'API Key 格式无效');
+export const ChatModelSchema = z.object({
+  id: z.string().uuid(),
+  ...modelFields,
+  hasApiKey: z.boolean(),
+  createdAt: timestamp,
+});
+export const CreateChatModelSchema = z.object({ ...modelFields, apiKey }).strict();
+export const UpdateChatModelSchema = z
+  .object({ ...modelFields, apiKey: apiKey.optional() })
+  .strict();
+export const ChatModelsResponseSchema = z.object({ items: z.array(ChatModelSchema) });
+export const ChatModelResponseSchema = z.object({ model: ChatModelSchema });
+export const CHAT_IMAGE_MAX_BYTES = 2 * 1024 * 1024;
+export const CHAT_IMAGES_MAX_BYTES = 8 * 1024 * 1024;
+export const CHAT_IMAGES_PER_MESSAGE = 4;
+const imagePrefix = /^data:image\/(png|jpeg|webp);base64,/;
+export function chatImageBytes(dataUrl: string): number {
+  const data = dataUrl.slice(dataUrl.indexOf(',') + 1);
+  return (data.length / 4) * 3 - (data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0);
+}
+export const ChatImageSchema = z
+  .object({
+    name: z.string().trim().min(1).max(255),
+    dataUrl: z
+      .string()
+      .max(4 * Math.ceil(CHAT_IMAGE_MAX_BYTES / 3) + 40, '单张图片不能超过 2 MB')
+      .refine((value) => {
+        const match = imagePrefix.exec(value);
+        if (!match || chatImageBytes(value) > CHAT_IMAGE_MAX_BYTES) return false;
+        const data = value.slice(match[0].length);
+        if (!data.length || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data))
+          return false;
+        try {
+          const header = atob(data.slice(0, 24));
+          if (match[1] === 'png') return header.startsWith('\x89PNG\r\n\x1a\n');
+          if (match[1] === 'jpeg') return header.startsWith('\xff\xd8\xff');
+          return header.startsWith('RIFF') && header.slice(8, 12) === 'WEBP';
+        } catch {
+          return false;
+        }
+      }, '请上传有效的 PNG、JPEG 或 WebP 图片，单张不能超过 2 MB'),
+  })
+  .strict();
+export const ChatMessageSchema = z
+  .object({
+    role: z.enum(['user', 'assistant']),
+    content: z.string().trim().max(16_000),
+    images: z.array(ChatImageSchema).min(1).max(CHAT_IMAGES_PER_MESSAGE).optional(),
+  })
+  .strict()
+  .refine(
+    ({ role, content, images }) =>
+      (role === 'user' || !images) && (content.length > 0 || (role === 'user' && !!images?.length)),
+    '消息不能为空，图片仅能附在用户消息中',
+  );
+export const ChatCompletionSchema = z
+  .object({
+    modelId: z.string().uuid(),
+    messages: z.array(ChatMessageSchema).min(1).max(50),
+    webSearch: z.boolean().optional(),
+    debug: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    ({ messages }) =>
+      messages.at(-1)?.role === 'user' &&
+      messages.reduce((total, message) => total + message.content.length, 0) <= 60_000,
+    '对话过长或最后一条不是用户消息，请开始新对话',
+  )
+  .refine(
+    ({ messages }) =>
+      messages.reduce(
+        (total, message) =>
+          total +
+          (message.images ?? []).reduce((bytes, image) => bytes + chatImageBytes(image.dataUrl), 0),
+        0,
+      ) <= CHAT_IMAGES_MAX_BYTES,
+    '对话图片合计不能超过 8 MB，请开始新对话',
+  );
+export const ChatCompletionResponseSchema = z.object({
+  usage: z
+    .object({
+      inputTokens: count,
+      outputTokens: count,
+    })
+    .optional(),
+  contextUsage: z
+    .object({
+      windowTokens: count.positive().nullable(),
+      source: z.enum(['runtime', 'configured', 'declared', 'unknown']),
+    })
+    .optional(),
+  content: z.string().min(1).max(100_000),
+  reasoning: z.string().min(1).max(100_000).optional(),
+  sources: z
+    .array(
+      z.object({
+        title: z.string().min(1).max(300),
+        url: z
+          .string()
+          .url()
+          .max(2048)
+          .refine((value) => {
+            const url = new URL(value);
+            return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password;
+          }),
+      }),
+    )
+    .max(20)
+    .optional(),
+  searchWarning: z.string().min(1).max(1000).optional(),
+  debug: ChatDebugTraceSchema.optional(),
+});
+export type ChatModel = z.output<typeof ChatModelSchema>;
+export type CreateChatModel = z.input<typeof CreateChatModelSchema>;
+export type UpdateChatModel = z.input<typeof UpdateChatModelSchema>;
+export type ChatMessage = z.output<typeof ChatMessageSchema>;
+export type ChatImage = z.output<typeof ChatImageSchema>;
+export type ChatCompletion = z.output<typeof ChatCompletionSchema>;
+export type ChatCompletionResponse = z.output<typeof ChatCompletionResponseSchema>;
 
 export type PublicUser = z.output<typeof PublicUserSchema>;
 export type ManagedUser = z.output<typeof ManagedUserSchema>;

@@ -19,18 +19,35 @@ enum UserRole {
 }
 
 model User {
-  id           String     @id @default(uuid()) @db.Uuid
-  email        String     @unique @db.VarChar(254)
-  name         String     @db.VarChar(80)
-  passwordHash String     @map("password_hash") @db.VarChar(255)
-  status       UserStatus @default(ACTIVE)
-  role         UserRole   @default(USER)
-  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  id           String      @id @default(uuid()) @db.Uuid
+  email        String      @unique @db.VarChar(254)
+  name         String      @db.VarChar(80)
+  passwordHash String      @map("password_hash") @db.VarChar(255)
+  status       UserStatus  @default(ACTIVE)
+  role         UserRole    @default(USER)
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
   sessions     Session[]
+  chatModels   ChatModel[]
 
   @@index([createdAt(sort: Desc), id(sort: Desc)])
   @@map("users")
+}
+
+model ChatModel {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  name          String   @db.VarChar(80)
+  model         String   @db.VarChar(200)
+  baseUrl       String   @map("base_url") @db.VarChar(2048)
+  apiKey        String   @map("api_key") @db.VarChar(4096)
+  contextWindow Int?     @map("context_window")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt, id])
+  @@map("chat_models")
 }
 
 model Session {
