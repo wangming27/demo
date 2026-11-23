@@ -6,6 +6,7 @@ import type { ModelMessage, ModelTool } from './model-api';
 import { WebToolsService } from './web-tools.service';
 import type { ChatTrace } from './chat-trace';
 import type { ChatProgress } from './chat-progress';
+import type { ChatRecording } from './chat-recording';
 
 const tools: ModelTool[] = [
   {
@@ -34,6 +35,7 @@ export class ChatAgentService {
     signal: AbortSignal,
     trace?: ChatTrace,
     progress?: ChatProgress,
+    recording?: ChatRecording,
   ): Promise<ChatCompletionResponse> {
     const messages: ModelMessage[] = [
       {
@@ -59,6 +61,7 @@ export class ChatAgentService {
         trace,
         round + 1,
         progress,
+        recording,
       );
       const thought = turn.reasoning_content?.trim() || turn.reasoning?.trim();
       if (thought) reasoning.push(thought);
@@ -86,16 +89,22 @@ export class ChatAgentService {
       for (const call of turn.tool_calls) {
         const started = Date.now();
         const execute = calls++ < 4;
+        const recordId = await recording?.toolStart(round + 1, call);
         if (execute) progress?.toolStart(round + 1, call.id, call.function.name);
         const result = await (async () => {
           try {
-            return execute
+            const result = execute
               ? await this.webTools.execute(call.function.name, call.function.arguments, signal)
               : {
                   data: { error: '查询次数已达上限，请根据已有数据回答' },
                   sources: [],
                   warning: '联网查询次数已达上限',
                 };
+            if (recordId) await recording?.toolEnd(recordId, result);
+            return result;
+          } catch (error) {
+            if (recordId) await recording?.toolError(recordId, error);
+            throw error;
           } finally {
             if (execute) progress?.toolEnd();
           }

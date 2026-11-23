@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
 import { resolve } from 'node:path';
+import { rm } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { verify } from 'argon2';
@@ -18,6 +19,7 @@ const { PrismaClient } = require('../.test-dist/generated/prisma/client.js');
 const apiDir = resolve(import.meta.dirname, '..');
 const origin = 'http://127.0.0.1:5173';
 const schema = `auth_test_${randomUUID().replaceAll('-', '')}`;
+const storageRoot = resolve(apiDir, '.chat-storage', schema);
 const databaseUrl = prismaConfig.datasource?.url;
 assert.notEqual(
   process.env.NODE_ENV,
@@ -103,6 +105,7 @@ before(
       PORT: String(port),
       DATABASE_URL: testUrl.toString(),
       AUTH_ALLOWED_ORIGINS: origin,
+      CHAT_STORAGE_ROOT: storageRoot,
     };
     execFileSync(
       process.execPath,
@@ -148,6 +151,7 @@ after(async () => {
     await childExit;
   }
   await prisma.$disconnect();
+  await rm(storageRoot, { recursive: true, force: true });
   try {
     if (schemaCreated) {
       // Only the randomly named schema created by this test is removed.
@@ -845,6 +849,14 @@ test('chat configuration ownership and model proxy', async (t) => {
       assert.equal(done.timing.thoughts.length, 1);
       assert.equal(done.timing.phase, 'done');
       assert.equal(done.answer.debug.status, 'success');
+      const feedResponse = await chat('/histories/feed');
+      assert.equal(feedResponse.status, 200);
+      const feed = await feedResponse.json();
+      assert.ok(feed.items.length <= 10);
+      assert.equal(feed.items[0].reply.content, '流式回答');
+      assert.equal(feed.items[0].id, done.answer.historyId);
+      assert.equal(feed.items[0].reply.reasoningContent, '先思考');
+      assert.equal((await chat('/histories/feed?cursor=invalid')).status, 400);
       assert.equal(received.body.stream, true);
       assert.equal(received.body.messages[0].content.length, 10_000);
       streamMode = 'truncated';
@@ -871,7 +883,9 @@ test('chat configuration ownership and model proxy', async (t) => {
     ];
     const response = await chat('/completions', 'POST', { modelId: first.id, messages });
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), {
+    const { historyId, ...answer } = await response.json();
+    assert.match(historyId, /^[a-f0-9-]{36}$/);
+    assert.deepEqual(answer, {
       content: '模型回复：你好',
       contextUsage: { windowTokens: null, source: 'unknown' },
     });
@@ -936,7 +950,9 @@ test('chat configuration ownership and model proxy', async (t) => {
         modelId: first.id,
         messages: [{ role: 'user', content: '用量' }],
       });
-      assert.deepEqual(await answer.json(), {
+      const { historyId, ...result } = await answer.json();
+      assert.ok(historyId);
+      assert.deepEqual(result, {
         content: '用量回答',
         usage: { inputTokens: 1500, outputTokens: 200 },
         contextUsage: { windowTokens: 32768, source: 'configured' },
@@ -964,6 +980,32 @@ test('chat configuration ownership and model proxy', async (t) => {
       });
       assert.equal(response.status, 200);
       const answer = await response.json();
+      const historyResponse = await chat(`/histories/${answer.historyId}`);
+      assert.equal(historyResponse.status, 200);
+      assert.equal(historyResponse.headers.get('cache-control'), 'no-store');
+      const archived = await historyResponse.json();
+      assert.equal(archived.history.resources.length, 1);
+      assert.equal(JSON.stringify(archived).includes('data:image'), false);
+      assert.equal(JSON.stringify(archived).includes('sk-replaced'), false);
+      assert.equal(
+        (await chat(`/histories/${answer.historyId}`, 'GET', undefined, otherCookie)).status,
+        404,
+      );
+      const resourcePath = `/histories/${answer.historyId}/resources/${archived.history.resources[0].id}`;
+      assert.equal((await chat(resourcePath, 'GET', undefined, otherCookie)).status, 404);
+      const file = await chat(resourcePath);
+      assert.equal(file.status, 200);
+      assert.equal(file.headers.get('content-type'), 'image/png');
+      assert.deepEqual(
+        Buffer.from(await file.arrayBuffer()),
+        Buffer.from(image.dataUrl.split(',')[1], 'base64'),
+      );
+      assert.equal(
+        (await chat(`/histories/${answer.historyId}`, 'DELETE', undefined, otherCookie)).status,
+        404,
+      );
+      assert.equal((await chat(`/histories/${answer.historyId}`, 'DELETE')).status, 204);
+      assert.equal((await chat(resourcePath)).status, 404);
       assert.deepEqual(received.body.messages, [
         {
           role: 'user',
@@ -1028,7 +1070,9 @@ test('chat configuration ownership and model proxy', async (t) => {
         messages: [{ role: 'user', content: '请回答' }],
       });
       assert.equal(response.status, 200);
-      assert.deepEqual(await response.json(), {
+      const { historyId, ...answer } = await response.json();
+      assert.ok(historyId);
+      assert.deepEqual(answer, {
         content: '最终回答',
         contextUsage: { windowTokens: null, source: 'unknown' },
         ...expected,

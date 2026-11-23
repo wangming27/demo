@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { ClipboardEventHandler, ReactNode } from 'react';
 import { Button } from '@douyinfe/semi-ui';
 import { CHAT_IMAGE_MAX_BYTES, CHAT_IMAGES_PER_MESSAGE, ChatImageSchema } from '@repo/contracts';
 import type { ChatImage } from '@repo/contracts';
@@ -45,6 +45,7 @@ export default function ChatImages({
   onChange,
   onError,
   onBusyChange,
+  input,
   children,
 }: {
   images: ChatImage[];
@@ -52,16 +53,19 @@ export default function ChatImages({
   onChange: (images: ChatImage[]) => void;
   onError: (message: string) => void;
   onBusyChange: (busy: boolean) => void;
+  input: ReactNode;
   children: ReactNode;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const readingRef = useRef(false);
   const [busy, setBusy] = useState(false);
   async function select(files: File[]) {
-    if (!files.length || busy || disabled) return;
+    if (!files.length || readingRef.current || disabled) return;
     if (images.length + files.length > CHAT_IMAGES_PER_MESSAGE) {
       onError('每条消息最多添加 4 张图片');
       return;
     }
+    readingRef.current = true;
     setBusy(true);
     onBusyChange(true);
     onError('');
@@ -72,12 +76,24 @@ export default function ChatImages({
     } catch (error) {
       onError(error instanceof Error ? error.message : '图片读取失败');
     } finally {
+      readingRef.current = false;
       setBusy(false);
       onBusyChange(false);
     }
   }
+  const paste: ClipboardEventHandler<HTMLDivElement> = (event) => {
+    if (!(event.target instanceof HTMLTextAreaElement)) return;
+    const files = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (!files.length) return;
+    if (!event.clipboardData.getData('text/plain')) event.preventDefault();
+    void select(files);
+  };
   return (
-    <div className="mt-3 space-y-2">
+    <div className="mt-3 space-y-2" onPaste={paste}>
+      {input}
       {!!images.length && (
         <div className="flex flex-wrap gap-3" aria-label="待发送图片">
           {images.map((image, index) => (

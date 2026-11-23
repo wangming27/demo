@@ -19,35 +19,144 @@ enum UserRole {
 }
 
 model User {
-  id           String      @id @default(uuid()) @db.Uuid
-  email        String      @unique @db.VarChar(254)
-  name         String      @db.VarChar(80)
-  passwordHash String      @map("password_hash") @db.VarChar(255)
-  status       UserStatus  @default(ACTIVE)
-  role         UserRole    @default(USER)
-  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt    DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
-  sessions     Session[]
-  chatModels   ChatModel[]
+  id            String        @id @default(uuid()) @db.Uuid
+  email         String        @unique @db.VarChar(254)
+  name          String        @db.VarChar(80)
+  passwordHash  String        @map("password_hash") @db.VarChar(255)
+  status        UserStatus    @default(ACTIVE)
+  role          UserRole      @default(USER)
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  sessions      Session[]
+  chatModels    ChatModel[]
+  chatHistories ChatHistory[]
 
   @@index([createdAt(sort: Desc), id(sort: Desc)])
   @@map("users")
 }
 
 model ChatModel {
-  id            String   @id @default(uuid()) @db.Uuid
-  userId        String   @map("user_id") @db.Uuid
-  name          String   @db.VarChar(80)
-  model         String   @db.VarChar(200)
-  baseUrl       String   @map("base_url") @db.VarChar(2048)
-  apiKey        String   @map("api_key") @db.VarChar(4096)
-  contextWindow Int?     @map("context_window")
-  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
-  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id            String        @id @default(uuid()) @db.Uuid
+  userId        String        @map("user_id") @db.Uuid
+  name          String        @db.VarChar(80)
+  model         String        @db.VarChar(200)
+  baseUrl       String        @map("base_url") @db.VarChar(2048)
+  apiKey        String        @map("api_key") @db.VarChar(4096)
+  contextWindow Int?          @map("context_window")
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt     DateTime?     @map("deleted_at") @db.Timestamptz(3)
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  histories     ChatHistory[]
 
+  @@unique([id, userId])
   @@index([userId, createdAt, id])
   @@map("chat_models")
+}
+
+enum ChatRecordStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  INTERRUPTED
+}
+
+model ChatHistory {
+  id                  String           @id @default(uuid()) @db.Uuid
+  userId              String           @map("user_id") @db.Uuid
+  modelId             String           @map("model_id") @db.Uuid
+  conversationId      String           @map("conversation_id") @db.Uuid
+  previousHistoryId   String?          @map("previous_history_id") @db.Uuid
+  retryOfHistoryId    String?          @map("retry_of_history_id") @db.Uuid
+  requestId           String           @map("request_id") @db.Uuid
+  requestHash         String           @map("request_hash") @db.Char(64)
+  query               String           @db.Text
+  schemaVersion       Int              @default(1) @map("schema_version")
+  nextSequence        Int              @default(1) @map("next_sequence")
+  contextUsedTokens   BigInt?          @map("context_used_tokens")
+  contextWindowTokens Int?             @map("context_window_tokens")
+  contextWindowSource String           @default("unknown") @map("context_window_source") @db.VarChar(20)
+  status              ChatRecordStatus @default(PENDING)
+  resources           Json             @default("[]")
+  timings             Json             @default("{}")
+  error               Json?
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  startedAt           DateTime?        @map("started_at") @db.Timestamptz(3)
+  finishedAt          DateTime?        @map("finished_at") @db.Timestamptz(3)
+  durationMs          BigInt?          @map("duration_ms")
+  heartbeatAt         DateTime         @default(now()) @map("heartbeat_at") @db.Timestamptz(3)
+  deletedAt           DateTime?        @map("deleted_at") @db.Timestamptz(3)
+  user                User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  model               ChatModel        @relation(fields: [modelId, userId], references: [id, userId], onDelete: NoAction)
+  previous            ChatHistory?     @relation("HistoryPrevious", fields: [previousHistoryId], references: [id], onDelete: SetNull)
+  following           ChatHistory[]    @relation("HistoryPrevious")
+  retryOf             ChatHistory?     @relation("HistoryRetry", fields: [retryOfHistoryId], references: [id], onDelete: SetNull)
+  retries             ChatHistory[]    @relation("HistoryRetry")
+  replies             ChatReply[]
+  toolCalls           ChatToolCall[]
+
+  @@unique([userId, requestId])
+  @@index([userId, createdAt(sort: Desc), id(sort: Desc)])
+  @@index([conversationId, createdAt, id])
+  @@index([status, heartbeatAt])
+  @@map("chat_histories")
+}
+
+model ChatReply {
+  id               String           @id @default(uuid()) @db.Uuid
+  historyId        String           @map("history_id") @db.Uuid
+  round            Int
+  sequence         Int
+  content          String?          @db.Text
+  reasoningContent String?          @map("reasoning_content") @db.Text
+  finishReason     String?          @map("finish_reason") @db.VarChar(200)
+  isFinal          Boolean          @default(false) @map("is_final")
+  inputTokens      BigInt?          @map("input_tokens")
+  outputTokens     BigInt?          @map("output_tokens")
+  status           ChatRecordStatus @default(PENDING)
+  resources        Json             @default("[]")
+  timings          Json             @default("{}")
+  error            Json?
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  startedAt        DateTime?        @map("started_at") @db.Timestamptz(3)
+  finishedAt       DateTime?        @map("finished_at") @db.Timestamptz(3)
+  durationMs       BigInt?          @map("duration_ms")
+  history          ChatHistory      @relation(fields: [historyId], references: [id], onDelete: Cascade)
+  toolCalls        ChatToolCall[]
+
+  @@unique([historyId, round])
+  @@unique([historyId, sequence])
+  @@unique([id, historyId])
+  @@map("chat_replies")
+}
+
+model ChatToolCall {
+  id           String           @id @default(uuid()) @db.Uuid
+  historyId    String           @map("history_id") @db.Uuid
+  replyId      String           @map("reply_id") @db.Uuid
+  round        Int
+  sequence     Int
+  toolCallId   String           @map("tool_call_id") @db.VarChar(200)
+  toolName     String           @map("tool_name") @db.VarChar(100)
+  argumentsRaw String           @map("arguments_raw") @db.Text
+  arguments    Json?
+  output       Json?
+  status       ChatRecordStatus @default(PENDING)
+  resources    Json             @default("[]")
+  timings      Json             @default("{}")
+  error        Json?
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  startedAt    DateTime?        @map("started_at") @db.Timestamptz(3)
+  finishedAt   DateTime?        @map("finished_at") @db.Timestamptz(3)
+  durationMs   BigInt?          @map("duration_ms")
+  history      ChatHistory      @relation(fields: [historyId], references: [id], onDelete: Cascade)
+  reply        ChatReply        @relation(fields: [replyId, historyId], references: [id, historyId], onDelete: Cascade)
+
+  @@unique([replyId, toolCallId])
+  @@unique([historyId, sequence])
+  @@map("chat_tool_calls")
 }
 
 model Session {

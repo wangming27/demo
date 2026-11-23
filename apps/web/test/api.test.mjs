@@ -6,12 +6,14 @@ import {
   getCurrentUser,
   getHealth,
   listUsers,
+  listChatHistory,
   login,
   logout,
   sendChat,
   streamChat,
   updateUser,
 } from '../src/services/api.ts';
+import { historyMessages, contextMessages } from '../src/pages/chat/chat-history.ts';
 
 const user = {
   id: 'cf44a477-9d24-4ee6-96eb-4b00b89aa95e',
@@ -305,6 +307,105 @@ test('request cancellation propagates the AbortError', async (t) => {
     return Promise.reject(options.signal.reason);
   });
   await assert.rejects(getCurrentUser(controller.signal), { name: 'AbortError' });
+});
+
+test('chat history uses an optional cursor, validates each page and preserves abort signals', async (t) => {
+  const signal = new AbortController().signal;
+  const fixture = {
+    items: [
+      {
+        id: user.id,
+        conversationId: user.id,
+        query: '历史问题',
+        createdAt: user.createdAt,
+        status: 'SUCCEEDED',
+        model: { id: user.id, name: '模型' },
+        resources: [],
+        reply: {
+          id: user.id,
+          content: '历史回答',
+          reasoningContent: '历史思考内容',
+          isFinal: true,
+        },
+        durationMs: 100,
+      },
+    ],
+    nextCursor: null,
+  };
+  let cursor = null;
+  t.mock.method(globalThis, 'fetch', async (path, options) => {
+    const url = new URL(path, 'http://localhost');
+    assert.equal(url.pathname, '/api/chat/histories/feed');
+    assert.equal(url.searchParams.get('cursor'), cursor);
+    assert.equal(options.signal, signal);
+    assert.equal(options.credentials, 'same-origin');
+    return json(fixture);
+  });
+  assert.deepEqual(await listChatHistory(null, signal), fixture);
+  cursor = user.id;
+  assert.deepEqual(await listChatHistory(cursor, signal), fixture);
+});
+
+test('restored chat messages are chronological, preserve partial replies and scope bounded model context', () => {
+  const item = (id, conversationId, query, content, status = 'SUCCEEDED') => ({
+    id,
+    conversationId,
+    query,
+    createdAt: user.createdAt,
+    status,
+    model: { id: user.id, name: '模型' },
+    resources: [],
+    reply: {
+      id,
+      content,
+      reasoningContent: id === 'new' || status === 'CANCELLED' ? `思考 ${id}` : null,
+      isFinal: true,
+    },
+    durationMs: 100,
+  });
+  const rows = [
+    item('new', 'current', '新问题', '新回答'),
+    item('failed', 'current', '失败问题', '部分正文', 'CANCELLED'),
+    item('old', 'current', '旧问题', '旧回答'),
+    item('other', 'other', '其他会话', '其他会话回答'),
+  ];
+  const messages = historyMessages(rows);
+  assert.deepEqual(
+    messages.map((message) => message.content),
+    ['其他会话', '其他会话回答', '旧问题', '旧回答', '失败问题', '部分正文', '新问题', '新回答'],
+  );
+  assert.equal(messages.find((message) => message.id === 'failed:assistant').incomplete, true);
+  assert.equal(messages.find((message) => message.id === 'new:assistant').reasoning, '思考 new');
+  assert.equal(
+    messages.find((message) => message.id === 'failed:assistant').reasoning,
+    '思考 failed',
+  );
+  assert.equal(messages.find((message) => message.id === 'old:assistant').reasoning, undefined);
+  assert.equal(messages.find((message) => message.id === 'new:user').reasoning, undefined);
+  const question = { role: 'user', content: '继续' };
+  assert.deepEqual(
+    contextMessages(messages, 'current', question).map((message) => message.content),
+    ['旧问题', '旧回答', '新问题', '新回答'],
+  );
+  const long = historyMessages(
+    Array.from({ length: 30 }, (_, index) =>
+      item(String(index), 'current', '问'.repeat(1000), '答'.repeat(1000)),
+    ),
+  );
+  const context = contextMessages(long, 'current', question);
+  assert.equal(context.length, 48);
+  assert.ok(
+    context.reduce((total, message) => total + message.content.length, question.content.length) <=
+      60_000,
+  );
+  const imageRow = {
+    ...rows[0],
+    query: '',
+    resources: [{ id: user.id, name: '图片.png', mime: 'image/png', bytes: 2 * 1024 * 1024 }],
+  };
+  const imageMessages = historyMessages([imageRow]);
+  assert.equal(imageMessages[0].historyImages[0].historyId, 'new');
+  assert.equal(imageMessages[0].historyImages[0].bytes, 2 * 1024 * 1024);
 });
 
 test('chat client preserves image data and image-only messages in the request', async (t) => {

@@ -10,7 +10,26 @@ dotenv.config({
   quiet: true,
 });
 
-export interface Environment {
+export interface ModelTimeouts {
+  modelFirstResponseTimeoutMs: number;
+  modelIdleTimeoutMs: number;
+}
+
+export function getModelTimeouts(): ModelTimeouts {
+  function timeout(name: string, fallback: number): number {
+    const value = Number(process.env[name] ?? fallback);
+    if (!Number.isInteger(value) || value < 1 || value > 2_147_483_647) {
+      throw new Error(`${name} must be an integer between 1 and 2147483647 (milliseconds)`);
+    }
+    return value;
+  }
+  return {
+    modelFirstResponseTimeoutMs: timeout('CHAT_MODEL_FIRST_RESPONSE_TIMEOUT_MS', 180_000),
+    modelIdleTimeoutMs: timeout('CHAT_MODEL_IDLE_TIMEOUT_MS', 60_000),
+  };
+}
+
+export interface Environment extends ModelTimeouts {
   production: boolean;
   databaseUrl: string;
   allowedOrigins: ReadonlySet<string>;
@@ -67,6 +86,7 @@ export function getEnvironment(): Environment {
   }
 
   return {
+    ...getModelTimeouts(),
     production,
     databaseUrl,
     allowedOrigins,

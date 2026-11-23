@@ -9,6 +9,8 @@ import { z } from 'zod';
 import type { ChatTrace } from './chat-trace';
 import type { ModelObserver } from './chat-progress';
 import { ModelStream } from './model-stream';
+import type { ChatRecording } from './chat-recording';
+import { getModelTimeouts } from '../config/environment';
 
 const blocked = new BlockList();
 for (const [address, prefix] of [
@@ -55,6 +57,7 @@ const upstreamSchema = z.object({
   choices: z
     .array(
       z.object({
+        finish_reason: z.string().max(200).nullish(),
         message: z.object({
           content: z.string().nullish(),
           reasoning_content: z.string().nullish(),
@@ -80,6 +83,7 @@ const upstreamSchema = z.object({
 
 export type ModelTurn = z.output<typeof upstreamSchema>['choices'][number]['message'] & {
   usage?: ChatCompletionResponse['usage'];
+  finishReason?: string | null;
 };
 const tokenCount = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const usageSchema = z
@@ -132,6 +136,7 @@ export async function callModel(
   signal: AbortSignal,
   trace?: ChatTrace,
   observer?: ModelObserver,
+  recording?: ChatRecording,
 ): Promise<ChatCompletionResponse> {
   const message = await callModelTurn(
     baseUrl,
@@ -144,6 +149,7 @@ export async function callModel(
     trace,
     1,
     observer,
+    recording,
   );
   const reasoning = message.reasoning_content?.trim() || message.reasoning?.trim();
   try {
@@ -168,7 +174,53 @@ export async function callModelTurn(
   trace?: ChatTrace,
   round = 1,
   observer?: ModelObserver,
+  recording?: ChatRecording,
 ): Promise<ModelTurn> {
+  await recording?.replyStart(round);
+  try {
+    const observed = observer
+      ? {
+          modelStart: (value: number) => observer.modelStart(value),
+          delta: (event: Parameters<ModelObserver['delta']>[0]) => {
+            recording?.delta(event);
+            observer.delta(event);
+          },
+          modelEnd: () => observer.modelEnd(),
+        }
+      : undefined;
+    const turn = await requestModelTurn(
+      baseUrl,
+      apiKey,
+      model,
+      messages,
+      signal,
+      tools,
+      toolChoice,
+      trace,
+      round,
+      observed,
+    );
+    await recording?.replyEnd(round, turn);
+    return turn;
+  } catch (error) {
+    await recording?.replyError(round, error);
+    throw error;
+  }
+}
+
+async function requestModelTurn(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  messages: ModelMessage[],
+  signal: AbortSignal,
+  tools?: ModelTool[],
+  toolChoice: 'auto' | 'none' = 'auto',
+  trace?: ChatTrace,
+  round = 1,
+  observer?: ModelObserver,
+): Promise<ModelTurn> {
+  const timeouts = getModelTimeouts();
   observer?.modelStart(round);
   const started = trace?.modelRequest(round, messages, tools, toolChoice);
   const url = modelEndpoint(baseUrl);
@@ -191,6 +243,29 @@ export async function callModelTurn(
       Array.isArray(message.content) && message.content.some((part) => part.type === 'image_url'),
   );
   const turn = await new Promise<ModelTurn>((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const clearDeadline = () => clearTimeout(timeout);
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearDeadline();
+      reject(error);
+      request.destroy();
+    };
+    const waitForOutput = (first: boolean) => {
+      if (settled) return;
+      clearDeadline();
+      timeout = setTimeout(
+        () =>
+          fail(
+            new GatewayTimeoutException(
+              first ? '模型首响应超时，请稍后重试' : '模型长时间无输出，请稍后重试',
+            ),
+          ),
+        first ? timeouts.modelFirstResponseTimeoutMs : timeouts.modelIdleTimeoutMs,
+      );
+    };
     const request = (url.protocol === 'https:' ? httpsRequest : httpRequest)(
       url,
       {
@@ -218,9 +293,8 @@ export async function callModelTurn(
       },
       (response) => {
         if (response.statusCode !== 200) {
-          response.resume();
           const status = response.statusCode;
-          reject(
+          fail(
             new BadGatewayException(
               status === 401 || status === 403
                 ? '模型 API 鉴权失败，请检查 API Key'
@@ -236,40 +310,56 @@ export async function callModelTurn(
           return;
         }
         const chunks: Buffer[] = [];
-        const stream = observer ? new ModelStream(round, observer) : undefined;
+        const stream = observer
+          ? new ModelStream(round, {
+              modelStart: (value) => observer.modelStart(value),
+              delta: (event) => {
+                if (event.content || event.reasoning || event.toolCall) waitForOutput(false);
+                observer.delta(event);
+              },
+              modelEnd: () => observer.modelEnd(),
+            })
+          : undefined;
         if (stream && !response.headers['content-type']?.includes('text/event-stream')) {
-          response.resume();
-          reject(new BadGatewayException('模型 API 未返回流式响应，请检查服务是否支持 SSE'));
+          fail(new BadGatewayException('模型 API 未返回流式响应，请检查服务是否支持 SSE'));
           return;
         }
         let bytes = 0;
         response.on('data', (chunk: Buffer) => {
+          if (settled) return;
           if (stream) {
             try {
               stream.push(chunk);
             } catch {
-              reject(new BadGatewayException('模型返回了无效的流式数据'));
-              request.destroy();
+              fail(new BadGatewayException('模型返回了无效的流式数据'));
             }
             return;
           }
           bytes += chunk.length;
           if (bytes > 1024 * 1024) {
-            request.destroy(new Error('Model response too large'));
+            fail(new BadGatewayException('模型响应过大'));
             return;
           }
+          if (chunk.length) waitForOutput(false);
           chunks.push(chunk);
         });
-        response.on('error', () => reject(new BadGatewayException('模型响应中断，请重试')));
+        response.on('error', () => fail(new BadGatewayException('模型响应中断，请重试')));
         response.on('end', () => {
+          if (settled) return;
           try {
             const body = upstreamSchema.parse(
               stream ? stream.finish() : JSON.parse(Buffer.concat(chunks).toString('utf8')),
             );
             const usage = normalizeUsage(body.usage);
-            resolve({ ...body.choices[0]!.message, ...(usage ? { usage } : {}) });
+            settled = true;
+            clearDeadline();
+            resolve({
+              ...body.choices[0]!.message,
+              finishReason: body.choices[0]!.finish_reason ?? null,
+              ...(usage ? { usage } : {}),
+            });
           } catch {
-            reject(
+            fail(
               new BadGatewayException(
                 stream ? '模型流式响应未完整结束或格式无效，请重试' : '模型返回了无法识别的内容',
               ),
@@ -278,12 +368,9 @@ export async function callModelTurn(
         });
       },
     );
-    const timeout = setTimeout(() => {
-      reject(new GatewayTimeoutException('模型响应超时，请稍后重试'));
-      request.destroy();
-    }, 60_000);
-    request.on('close', () => clearTimeout(timeout));
-    request.on('error', () => reject(new BadGatewayException('无法连接模型 API，请检查配置')));
+    request.on('close', clearDeadline);
+    request.on('error', () => fail(new BadGatewayException('无法连接模型 API，请检查配置')));
+    waitForOutput(true);
     request.end(payload);
   });
   if (started !== undefined) trace?.modelResponse(round, started, turn);

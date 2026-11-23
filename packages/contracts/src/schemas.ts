@@ -220,6 +220,10 @@ export const ChatMessageSchema = z
 export const ChatCompletionSchema = z
   .object({
     modelId: z.string().uuid(),
+    requestId: z.string().uuid().optional(),
+    conversationId: z.string().uuid().optional(),
+    previousHistoryId: z.string().uuid().optional(),
+    retryOfHistoryId: z.string().uuid().optional(),
     messages: z.array(ChatMessageSchema).min(1).max(50),
     webSearch: z.boolean().optional(),
     debug: z.boolean().optional(),
@@ -242,6 +246,7 @@ export const ChatCompletionSchema = z
     '对话图片合计不能超过 8 MB，请开始新对话',
   );
 export const ChatCompletionResponseSchema = z.object({
+  historyId: z.string().uuid().optional(),
   usage: z
     .object({
       inputTokens: count,
@@ -282,6 +287,44 @@ export type ChatMessage = z.output<typeof ChatMessageSchema>;
 export type ChatImage = z.output<typeof ChatImageSchema>;
 export type ChatCompletion = z.output<typeof ChatCompletionSchema>;
 export type ChatCompletionResponse = z.output<typeof ChatCompletionResponseSchema>;
+
+export const ChatHistoryQuerySchema = z.object({ cursor: z.string().uuid().optional() }).strict();
+export const ChatHistoryEntrySchema = z.object({
+  id: z.string().uuid(),
+  conversationId: z.string().uuid(),
+  query: z.string().max(16_000),
+  createdAt: timestamp,
+  status: z.enum(['PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'INTERRUPTED']),
+  model: z.object({ id: z.string().uuid(), name: z.string() }),
+  resources: z.array(
+    z.object({
+      id: z.string().uuid(),
+      name: z.string(),
+      mime: z.enum(['image/png', 'image/jpeg', 'image/webp', 'application/json']),
+      bytes: count,
+    }),
+  ),
+  reply: z
+    .object({
+      id: z.string().uuid(),
+      content: z.string().nullable(),
+      reasoningContent: z.string().nullable(),
+      isFinal: z.boolean(),
+      usage: ChatCompletionResponseSchema.shape.usage,
+    })
+    .nullable(),
+  contextUsage: ChatCompletionResponseSchema.shape.contextUsage,
+  timing: z.lazy(() => ChatTimingSchema).optional(),
+  durationMs: count.nullable(),
+  sources: ChatCompletionResponseSchema.shape.sources,
+  searchWarning: ChatCompletionResponseSchema.shape.searchWarning,
+});
+export const ChatHistoryPageSchema = z.object({
+  items: z.array(ChatHistoryEntrySchema).max(10),
+  nextCursor: z.string().uuid().nullable(),
+});
+export type ChatHistoryEntry = z.output<typeof ChatHistoryEntrySchema>;
+export type ChatHistoryPage = z.output<typeof ChatHistoryPageSchema>;
 const duration = z.number().finite().nonnegative();
 const span = z.object({
   round: z.number().int().min(1).max(4),

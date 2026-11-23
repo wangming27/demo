@@ -20,6 +20,7 @@ import type {
   ChatCompletionResponse,
   ChatDebugTrace,
   ChatStreamEvent,
+  ChatHistoryPage,
 } from '@repo/contracts';
 import { initClient, ResponseValidationError, validateResponse } from '@ts-rest/core';
 
@@ -207,6 +208,54 @@ export async function listChatModels(signal: AbortSignal): Promise<ChatModel[]> 
   const result = await request(client.chat.listModels({ fetchOptions: { signal } }));
   assertStatus(result, 200);
   return result.body.items;
+}
+
+export async function listChatHistory(
+  cursor: string | null,
+  signal: AbortSignal,
+): Promise<ChatHistoryPage> {
+  const result = await request(
+    client.chat.history({
+      query: cursor ? { cursor } : {},
+      fetchOptions: { signal },
+    }),
+  );
+  assertStatus(result, 200);
+  return result.body;
+}
+
+export function chatResourceUrl(historyId: string, resourceId: string) {
+  return `/api/chat/histories/${historyId}/resources/${resourceId}`;
+}
+
+export async function readChatImage(
+  historyId: string,
+  resourceId: string,
+  name: string,
+  signal: AbortSignal,
+) {
+  const response = await fetch(chatResourceUrl(historyId, resourceId), {
+    credentials: 'same-origin',
+    signal,
+  });
+  if (!response.ok) throw new ApiError('历史图片读取失败，请重试', response.status);
+  const blob = await response.blob();
+  signal.throwIfAborted();
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () =>
+      typeof reader.result === 'string'
+        ? resolve(reader.result)
+        : reject(new Error('历史图片读取失败'));
+    reader.onerror = () => reject(new Error('历史图片读取失败'));
+    const abort = () => reader.abort();
+    reader.onabort = () =>
+      reject(signal.reason instanceof Error ? signal.reason : new Error('读取已取消'));
+    reader.onloadend = () => signal.removeEventListener('abort', abort);
+    signal.addEventListener('abort', abort, { once: true });
+    reader.readAsDataURL(blob);
+  });
+  return { name, dataUrl };
 }
 
 export async function createChatModel(

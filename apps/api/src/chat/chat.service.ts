@@ -6,7 +6,8 @@ import { callModel, modelEndpoint } from './model-api';
 import { ChatAgentService } from './chat-agent.service';
 import { ChatTrace } from './chat-trace';
 import { resolveContextWindow } from './model-context';
-import type { ChatProgress } from './chat-progress';
+import { ChatProgress } from './chat-progress';
+import { ChatHistoryService } from './chat-history.service';
 
 function serialize(model: ChatModel) {
   return {
@@ -25,11 +26,12 @@ export class ChatService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly agent: ChatAgentService,
+    private readonly histories: ChatHistoryService,
   ) {}
 
   async list(userId: string) {
     const models = await this.prisma.chatModel.findMany({
-      where: { userId },
+      where: { userId, deletedAt: null },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
     return { items: models.map(serialize) };
@@ -53,7 +55,7 @@ export class ChatService {
   async update(userId: string, id: string, input: UpdateChatModel) {
     modelEndpoint(input.baseUrl);
     const result = await this.prisma.chatModel.updateManyAndReturn({
-      where: { id, userId },
+      where: { id, userId, deletedAt: null },
       data: {
         name: input.name,
         model: input.model,
@@ -68,7 +70,10 @@ export class ChatService {
   }
 
   async delete(userId: string, id: string) {
-    const result = await this.prisma.chatModel.deleteMany({ where: { id, userId } });
+    const result = await this.prisma.chatModel.updateMany({
+      where: { id, userId, deletedAt: null },
+      data: { deletedAt: new Date() },
+    });
     if (!result.count) throw new NotFoundException('模型配置不存在');
   }
 
@@ -78,26 +83,40 @@ export class ChatService {
     signal: AbortSignal,
     progress?: ChatProgress,
   ) {
-    const model = await this.prisma.chatModel.findFirst({ where: { id: input.modelId, userId } });
-    if (!model) throw new NotFoundException('模型配置不存在，请重新选择');
+    const recording = await this.histories.begin(userId, input, signal);
+    if ('replay' in recording) return recording.replay;
+    const journal = recording.journal;
+    const model = await this.prisma.chatModel.findFirst({
+      where: { id: input.modelId, userId, deletedAt: null },
+    });
+    if (!model) {
+      const error = new NotFoundException('模型配置不存在，请重新选择');
+      await journal.finishError(error);
+      throw error;
+    }
+    const timing = progress ?? new ChatProgress(() => undefined);
     const trace = input.debug
       ? new ChatTrace({ name: model.name, model: model.model, baseUrl: model.baseUrl })
       : undefined;
     try {
       const answer = input.webSearch
-        ? await this.agent.complete(model, input.messages, signal, trace, progress)
+        ? await this.agent.complete(model, input.messages, journal.signal, trace, progress, journal)
         : await callModel(
             model.baseUrl,
             model.apiKey,
             model.model,
             input.messages,
-            signal,
+            journal.signal,
             trace,
             progress,
+            journal,
           );
-      const contextUsage = await resolveContextWindow(model, signal);
-      return { ...answer, contextUsage, ...(trace ? { debug: trace.finish('success') } : {}) };
+      const contextUsage = await resolveContextWindow(model, journal.signal);
+      const completed = { ...answer, contextUsage, historyId: journal.row.id };
+      await journal.finish(completed, timing.finish());
+      return { ...completed, ...(trace ? { debug: trace.finish('success') } : {}) };
     } catch (error) {
+      await journal.finishError(error, timing.finish());
       if (trace && error instanceof HttpException && !signal.aborted) {
         trace.error(error.message);
         const body = error.getResponse();

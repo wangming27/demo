@@ -17,6 +17,8 @@ import {
   ChatModelsResponseSchema,
   CreateChatModelSchema,
   UpdateChatModelSchema,
+  ChatHistoryQuerySchema,
+  ChatHistoryPageSchema,
 } from './schemas';
 
 export * from './schemas';
@@ -106,6 +108,12 @@ export const healthContract = c.router(
 );
 export const chatContract = c.router(
   {
+    history: {
+      method: 'GET',
+      path: '/chat/histories/feed',
+      query: ChatHistoryQuerySchema,
+      responses: { 200: ChatHistoryPageSchema },
+    },
     listModels: {
       method: 'GET',
       path: '/chat/models',

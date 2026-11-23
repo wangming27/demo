@@ -7,6 +7,7 @@ const chunkSchema = z.object({
   choices: z.array(
     z.object({
       index: z.number().int().optional(),
+      finish_reason: z.string().max(200).nullish(),
       delta: z.object({
         content: z.string().nullish(),
         reasoning_content: z.string().nullish(),
@@ -36,6 +37,7 @@ export class ModelStream {
   private content = '';
   private reasoning = '';
   private usage: unknown;
+  private finishReason: string | null = null;
   private readonly calls = new Map<
     number,
     { id: string; type: 'function'; function: { name: string; arguments: string } }
@@ -58,7 +60,9 @@ export class ModelStream {
       }
       const parsed = chunkSchema.parse(JSON.parse(data));
       if (parsed.usage !== undefined) this.usage = parsed.usage;
-      const delta = parsed.choices.find((choice) => (choice.index ?? 0) === 0)?.delta;
+      const choice = parsed.choices.find((choice) => (choice.index ?? 0) === 0);
+      if (choice?.finish_reason) this.finishReason = choice.finish_reason;
+      const delta = choice?.delta;
       if (!delta) continue;
       const reasoning = delta.reasoning_content || delta.reasoning || '';
       const content = delta.content || '';
@@ -99,6 +103,7 @@ export class ModelStream {
       usage: this.usage,
       choices: [
         {
+          finish_reason: this.finishReason,
           message: {
             content: this.content || null,
             ...(this.reasoning ? { reasoning_content: this.reasoning } : {}),

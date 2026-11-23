@@ -1,10 +1,17 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Avatar, Banner, Button, Select, Spin } from '@douyinfe/semi-ui';
 import { Link } from 'react-router';
 import { ChatCompletionSchema } from '@repo/contracts';
-import type { ChatCompletionResponse, ChatImage } from '@repo/contracts';
-import { ApiError, listChatModels, streamChat } from '../../services/api';
+import type { ChatImage } from '@repo/contracts';
+import {
+  ApiError,
+  listChatModels,
+  listChatHistory,
+  readChatImage,
+  chatResourceUrl,
+  streamChat,
+} from '../../services/api';
 import type { ChatMessage, ChatModel, User } from '../../services/api';
 import Icon from '../../components/common/Icon';
 import ModelSettings from '../../components/chat/ModelSettings';
@@ -14,7 +21,9 @@ import ChatImages, { ImagePreviews } from '../../components/chat/ChatImages';
 import type { DebugRun } from '../../components/chat/ChatDebugPanel';
 import { initialOf } from '../../utils/user-format';
 import ChatTimings from '../../components/chat/ChatTimings';
-import type { DisplayTiming } from '../../components/chat/ChatTimings';
+import ChatMarkdown from '../../components/chat/ChatMarkdown';
+import { contextMessages, historyMessages } from './chat-history';
+import type { DisplayMessage } from './chat-history';
 
 interface Props {
   user: User;
@@ -22,19 +31,6 @@ interface Props {
   sessionError: string;
   onLogout: () => void;
   onSessionExpired: () => void;
-}
-
-interface DisplayMessage extends ChatMessage {
-  id: string;
-  modelName?: string;
-  reasoning?: string;
-  sources?: ChatCompletionResponse['sources'];
-  searchWarning?: string;
-  usage?: ChatCompletionResponse['usage'];
-  contextUsage?: ChatCompletionResponse['contextUsage'];
-  timing?: DisplayTiming;
-  incomplete?: boolean;
-  historyEligible?: boolean;
 }
 
 export default function ChatPage({
@@ -63,9 +59,23 @@ export default function ChatPage({
   const userMessageRef = useRef<ChatMessage | null>(null);
   const [error, setError] = useState('');
   const requestRef = useRef<AbortController | null>(null);
+  const conversationRef = useRef<string>(crypto.randomUUID());
+  const previousHistoryRef = useRef<string | undefined>(undefined);
   const debugRunRef = useRef<string | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const followRef = useRef(true);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const restoreRef = useRef<{ id: string; offset: number } | null>(null);
+  const scrollTopRef = useRef(0);
+  const historyRequestRef = useRef<AbortController | null>(null);
+  const cursorRef = useRef<string | null>(null);
+  const [historyInitial, setHistoryInitial] = useState(true);
+  const [historyMore, setHistoryMore] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [historyReady, setHistoryReady] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [historyReload, setHistoryReload] = useState(0);
+  const liveStartedRef = useRef(false);
   const selected = models.find((model) => model.id === selectedId) ?? models[0];
 
   useEffect(() => {
@@ -90,16 +100,110 @@ export default function ChatPage({
     return () => controller.abort();
   }, [onSessionExpired, reload]);
 
-  useEffect(() => () => requestRef.current?.abort(), []);
   useEffect(() => {
-    if (followRef.current) endRef.current?.scrollIntoView({ block: 'end' });
-  }, [messages, sending, pendingAnswer]);
+    const controller = new AbortController();
+    historyRequestRef.current = controller;
+    setHistoryInitial(true);
+    setHistoryError('');
+    void listChatHistory(null, controller.signal)
+      .then((page) => {
+        if (controller.signal.aborted) return;
+        const latest = page.items[0];
+        if (latest && !liveStartedRef.current) {
+          conversationRef.current = latest.conversationId;
+          setSelectedId(latest.model.id);
+          previousHistoryRef.current = page.items.find(
+            (item) => item.conversationId === latest.conversationId && item.status === 'SUCCEEDED',
+          )?.id;
+        }
+        cursorRef.current = page.nextCursor;
+        setHasMore(!!page.nextCursor);
+        setMessages((current) => {
+          const seen = new Set(current.map((item) => item.historyId));
+          return [...historyMessages(page.items.filter((item) => !seen.has(item.id))), ...current];
+        });
+        setHistoryReady(true);
+      })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        if (error instanceof ApiError && error.status === 401) onSessionExpired();
+        else setHistoryError(error instanceof Error ? error.message : '历史记录加载失败');
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setHistoryInitial(false);
+        if (historyRequestRef.current === controller) historyRequestRef.current = null;
+      });
+    return () => {
+      controller.abort();
+      historyRequestRef.current?.abort();
+    };
+  }, [onSessionExpired, historyReload]);
+
+  useEffect(() => () => requestRef.current?.abort(), []);
+  useLayoutEffect(() => {
+    const scroll = scrollRef.current;
+    if (!scroll) return;
+    const restore = restoreRef.current;
+    if (restore) {
+      const anchor = Array.from(scroll.querySelectorAll<HTMLElement>('[data-message-id]')).find(
+        (element) => element.dataset['messageId'] === restore.id,
+      );
+      if (anchor)
+        scroll.scrollTop +=
+          anchor.getBoundingClientRect().top - scroll.getBoundingClientRect().top - restore.offset;
+      restoreRef.current = null;
+    } else if (followRef.current) {
+      scroll.scrollTop = scroll.scrollHeight;
+    }
+    scrollTopRef.current = scroll.scrollTop;
+  }, [messages, sending, pendingAnswer, loading, historyInitial]);
+
+  async function loadOlder() {
+    const cursor = cursorRef.current;
+    if (!cursor || historyRequestRef.current || requestRef.current || historyInitial) return;
+    const controller = new AbortController();
+    historyRequestRef.current = controller;
+    setHistoryMore(true);
+    setHistoryError('');
+    try {
+      const page = await listChatHistory(cursor, controller.signal);
+      if (controller.signal.aborted) return;
+      const scroll = scrollRef.current;
+      const top = scroll?.getBoundingClientRect().top ?? 0;
+      const anchor =
+        scroll &&
+        Array.from(scroll.querySelectorAll<HTMLElement>('[data-message-id]')).find(
+          (element) => element.getBoundingClientRect().bottom > top,
+        );
+      if (anchor)
+        restoreRef.current = {
+          id: anchor.dataset['messageId']!,
+          offset: anchor.getBoundingClientRect().top - top,
+        };
+      followRef.current = false;
+      cursorRef.current = page.nextCursor;
+      setHasMore(!!page.nextCursor);
+      setMessages((current) => {
+        const seen = new Set(current.map((item) => item.historyId));
+        return [...historyMessages(page.items.filter((item) => !seen.has(item.id))), ...current];
+      });
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      if (error instanceof ApiError && error.status === 401) onSessionExpired();
+      else setHistoryError(error instanceof Error ? error.message : '更早记录加载失败');
+    } finally {
+      if (!controller.signal.aborted) setHistoryMore(false);
+      if (historyRequestRef.current === controller) historyRequestRef.current = null;
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const started = performance.now();
     if (
       requestRef.current ||
+      historyRequestRef.current ||
+      historyInitial ||
       imagesBusy ||
       (!draft.trim() && !images.length) ||
       !selected ||
@@ -108,23 +212,53 @@ export default function ChatPage({
     )
       return;
     const content = draft.trim();
+    liveStartedRef.current = true;
     const userMessage: ChatMessage = {
       role: 'user',
       content,
       ...(images.length ? { images } : {}),
     };
-    const history: ChatMessage[] = [
-      ...messages
-        .filter((message) => message.historyEligible !== false)
-        .map(({ role, content, images }) => ({
-          role,
-          content,
-          ...(images ? { images } : {}),
-        })),
-      userMessage,
-    ];
+    const context = contextMessages(messages, conversationRef.current, userMessage);
+    const imageController = new AbortController();
+    requestRef.current = imageController;
+    setImagesBusy(true);
+    let history: ChatMessage[];
+    try {
+      history = [];
+      for (const message of context) {
+        const restoredImages = [...(message.images ?? [])];
+        for (const resource of message.historyImages ?? [])
+          restoredImages.push(
+            await readChatImage(
+              resource.historyId,
+              resource.id,
+              resource.name,
+              imageController.signal,
+            ),
+          );
+        history.push({
+          role: message.role,
+          content: message.content,
+          ...(restoredImages.length ? { images: restoredImages } : {}),
+        });
+      }
+      history.push(userMessage);
+    } catch (error) {
+      if (!imageController.signal.aborted) {
+        if (error instanceof ApiError && error.status === 401) onSessionExpired();
+        else setError(error instanceof Error ? error.message : '历史图片读取失败');
+      }
+      return;
+    } finally {
+      if (requestRef.current === imageController) requestRef.current = null;
+      setImagesBusy(false);
+    }
+    if (imageController.signal.aborted) return;
     const input = ChatCompletionSchema.safeParse({
       modelId: selected.id,
+      requestId: crypto.randomUUID(),
+      conversationId: conversationRef.current,
+      previousHistoryId: previousHistoryRef.current,
       messages: history,
       webSearch: true,
       debug: true,
@@ -200,6 +334,7 @@ export default function ChatPage({
       const answer = completed.answer;
       const finalTiming = answerRef.current?.timing;
       if (!controller.signal.aborted && requestRef.current === controller) {
+        previousHistoryRef.current = answer.historyId;
         setDebugRuns((current) =>
           current.map((run) =>
             run.id === debugId
@@ -209,10 +344,17 @@ export default function ChatPage({
         );
         setMessages((current) => [
           ...current,
-          { id: crypto.randomUUID(), ...userMessage },
+          {
+            id: crypto.randomUUID(),
+            ...userMessage,
+            ...(answer.historyId ? { historyId: answer.historyId } : {}),
+            conversationId: conversationRef.current,
+          },
           {
             id: crypto.randomUUID(),
             role: 'assistant',
+            ...(answer.historyId ? { historyId: answer.historyId } : {}),
+            conversationId: conversationRef.current,
             content: answer.content,
             modelName: selected.name,
             ...(finalTiming ? { timing: finalTiming } : {}),
@@ -398,20 +540,60 @@ export default function ChatPage({
           </div>
         )}
         <div
+          ref={scrollRef}
+          style={{ overflowAnchor: 'none' }}
           className="min-h-0 flex-1 overflow-y-auto py-6"
           role="log"
           aria-label="对话记录"
           aria-live="polite"
-          aria-busy={sending}
+          aria-busy={sending || historyInitial || historyMore}
           onScroll={(event) => {
             const element = event.currentTarget;
             followRef.current =
               element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+            const upward = element.scrollTop < scrollTopRef.current;
+            scrollTopRef.current = element.scrollTop;
+            if (upward && element.scrollTop < 80 && !historyError) void loadOlder();
+          }}
+          onWheel={(event) => {
+            if (event.deltaY < 0 && event.currentTarget.scrollTop < 80 && !historyError)
+              void loadOlder();
           }}
         >
-          {loading ? (
+          {(historyReady || historyError) && (
+            <div className="mb-4 flex min-h-8 items-center justify-center gap-2 text-xs text-muted">
+              {historyMore ? (
+                <Spin size="small" aria-label="加载更早记录" />
+              ) : historyError ? (
+                <>
+                  <span role="alert">{historyError}</span>
+                  <Button
+                    size="small"
+                    theme="borderless"
+                    onClick={() =>
+                      historyReady ? void loadOlder() : setHistoryReload((value) => value + 1)
+                    }
+                  >
+                    重试
+                  </Button>
+                </>
+              ) : hasMore ? (
+                <Button
+                  size="small"
+                  theme="borderless"
+                  disabled={sending}
+                  onClick={() => void loadOlder()}
+                >
+                  向上滚动加载更早记录
+                </Button>
+              ) : messages.length > 0 ? (
+                <span>已加载全部历史记录</span>
+              ) : null}
+            </div>
+          )}
+          {loading || historyInitial ? (
             <div className="flex h-full items-center justify-center">
-              <Spin aria-label="加载模型" />
+              <Spin aria-label="加载对话" />
             </div>
           ) : messages.length === 0 && !sending ? (
             <div className="flex h-full flex-col items-center justify-center px-4 text-center">
@@ -460,7 +642,14 @@ export default function ChatPage({
                   className="w-full sm:w-64"
                   value={selected?.id}
                   placeholder="请先配置模型"
-                  disabled={loading || sending || !!loadError || !models.length}
+                  disabled={
+                    loading ||
+                    historyInitial ||
+                    sending ||
+                    imagesBusy ||
+                    !!loadError ||
+                    !models.length
+                  }
                   optionList={models.map((item) => ({ value: item.id, label: item.name }))}
                   onChange={(value) => {
                     if (typeof value === 'string') setSelectedId(value);
@@ -468,30 +657,45 @@ export default function ChatPage({
                 />
               </div>
             </div>
-            <textarea
-              aria-label="消息内容"
-              className="block w-full resize-none bg-transparent text-sm leading-6 outline-none disabled:opacity-50"
-              rows={3}
-              maxLength={16000}
-              placeholder={
-                models.length ? '输入消息，或添加图片让模型识别…' : '配置模型后即可发送消息'
-              }
-              value={draft}
-              disabled={sending || loading || !models.length || !!loadError}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  event.currentTarget.form?.requestSubmit();
-                }
-              }}
-            />
             <ChatImages
               images={images}
-              disabled={sending || loading || !models.length || !!loadError}
+              disabled={sending || loading || historyInitial || !models.length || !!loadError}
               onChange={setImages}
               onError={setError}
               onBusyChange={setImagesBusy}
+              input={
+                <textarea
+                  aria-label="消息内容"
+                  className="block w-full resize-none bg-transparent text-sm leading-6 outline-none disabled:opacity-50"
+                  rows={3}
+                  maxLength={16000}
+                  placeholder={
+                    models.length
+                      ? '输入消息，或粘贴、添加图片让模型识别…'
+                      : '配置模型后即可发送消息'
+                  }
+                  value={draft}
+                  disabled={
+                    sending ||
+                    loading ||
+                    historyInitial ||
+                    imagesBusy ||
+                    !models.length ||
+                    !!loadError
+                  }
+                  onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key === 'Enter' &&
+                      !event.shiftKey &&
+                      !event.nativeEvent.isComposing
+                    ) {
+                      event.preventDefault();
+                      event.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                />
+              }
             >
               {sending ? (
                 <Button onClick={stop}>停止生成</Button>
@@ -503,6 +707,8 @@ export default function ChatPage({
                   aria-label="发送"
                   disabled={
                     loading ||
+                    historyInitial ||
+                    historyMore ||
                     imagesBusy ||
                     !!loadError ||
                     !selected ||
@@ -513,7 +719,7 @@ export default function ChatPage({
             </ChatImages>
           </form>
           <p className="mt-3 text-center text-xs text-muted">
-            对话仅保留在当前页面。AI 回复请自行核实。
+            对话自动保存，可向上滚动查看历史。AI 回复请自行核实。
           </p>
         </div>
       </main>
@@ -545,21 +751,47 @@ export default function ChatPage({
 function Message({ message, userName }: { message: DisplayMessage; userName: string }) {
   const own = message.role === 'user';
   return (
-    <article className={`flex ${own ? 'justify-end' : 'justify-start'}`}>
+    <article
+      data-message-id={message.id}
+      className={`flex ${own ? 'justify-end' : 'justify-start'}`}
+    >
       <div
-        className={`max-w-[90%] rounded-2xl px-5 py-4 sm:max-w-[85%] ${own ? 'bg-indigo-50' : 'border border-line bg-surface'}`}
+        className={`min-w-0 max-w-[90%] rounded-2xl px-5 py-4 sm:max-w-[85%] ${own ? 'bg-indigo-50' : 'border border-line bg-surface'}`}
       >
         <p className="mb-2 text-xs font-medium text-muted">{own ? userName : message.modelName}</p>
         {!!message.images?.length && <ImagePreviews images={message.images} />}
+        {!!message.historyImages?.length && (
+          <div className="mb-3 flex flex-wrap gap-2">
+            {message.historyImages.map((resource) => (
+              <a
+                key={resource.id}
+                href={chatResourceUrl(resource.historyId, resource.id)}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label={`查看图片 ${resource.name}`}
+              >
+                <img
+                  src={chatResourceUrl(resource.historyId, resource.id)}
+                  alt={resource.name}
+                  className="h-48 w-64 max-w-full rounded-lg border border-line object-contain"
+                />
+              </a>
+            ))}
+          </div>
+        )}
         {!own && message.reasoning && (
           <details open className="mb-4 rounded-xl border border-line bg-canvas px-4 py-3">
             <summary className="cursor-pointer text-sm font-medium text-muted">模型思考</summary>
-            <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-7 text-muted">
-              {message.reasoning}
-            </p>
+            <div className="mt-3 text-muted">
+              <ChatMarkdown content={message.reasoning} />
+            </div>
           </details>
         )}
-        <p className="whitespace-pre-wrap break-words text-sm leading-7">{message.content}</p>
+        {own ? (
+          <p className="whitespace-pre-wrap break-words text-sm leading-7">{message.content}</p>
+        ) : (
+          <ChatMarkdown content={message.content} />
+        )}
         {!own && message.searchWarning && (
           <p role="status" className="mt-3 text-xs text-amber-700">
             {message.searchWarning}
