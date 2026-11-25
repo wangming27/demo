@@ -1,10 +1,11 @@
-import { HttpException, Injectable, NotFoundException } from '@nestjs/common';
+import { Inject, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import type { ChatCompletion, CreateChatModel, UpdateChatModel } from '@repo/contracts';
 import { PrismaService } from '../database/prisma.service';
 import type { ChatModel } from '../generated/prisma/client';
 import { callModel, modelEndpoint } from './model-api';
 import { ChatAgentService } from './chat-agent.service';
-import { ChatTrace } from './chat-trace';
+import { CHAT_DIAGNOSTICS, observe, safeTrace } from './chat-diagnostics';
+import type { ChatDiagnostics } from './chat-diagnostics';
 import { resolveContextWindow } from './model-context';
 import { ChatProgress } from './chat-progress';
 import { ChatHistoryService } from './chat-history.service';
@@ -27,6 +28,7 @@ export class ChatService {
     private readonly prisma: PrismaService,
     private readonly agent: ChatAgentService,
     private readonly histories: ChatHistoryService,
+    @Optional() @Inject(CHAT_DIAGNOSTICS) private readonly diagnostics?: ChatDiagnostics,
   ) {}
 
   async list(userId: string) {
@@ -95,9 +97,17 @@ export class ChatService {
       throw error;
     }
     const timing = progress ?? new ChatProgress(() => undefined);
-    const trace = input.debug
-      ? new ChatTrace({ name: model.name, model: model.model, baseUrl: model.baseUrl })
+    const requestId = journal.row.requestId;
+    const collector = this.diagnostics
+      ? observe(() =>
+          this.diagnostics!.start(userId, requestId, {
+            name: model.name,
+            model: model.model,
+            baseUrl: model.baseUrl,
+          }),
+        )
       : undefined;
+    const trace = collector ? safeTrace(collector) : undefined;
     try {
       const answer = input.webSearch
         ? await this.agent.complete(model, input.messages, journal.signal, trace, progress, journal)
@@ -114,20 +124,15 @@ export class ChatService {
       const contextUsage = await resolveContextWindow(model, journal.signal);
       const completed = { ...answer, contextUsage, historyId: journal.row.id };
       await journal.finish(completed, timing.finish());
-      return { ...completed, ...(trace ? { debug: trace.finish('success') } : {}) };
+      if (trace) observe(() => this.diagnostics?.finish(userId, requestId, trace, 'success'));
+      return completed;
     } catch (error) {
       await journal.finishError(error, timing.finish());
-      if (trace && error instanceof HttpException && !signal.aborted) {
-        trace.error(error.message);
-        const body = error.getResponse();
-        throw new HttpException(
-          {
-            ...(typeof body === 'string' ? { message: body } : body),
-            debug: trace.finish('error'),
-          },
-          error.getStatus(),
-        );
-      }
+      if (trace)
+        observe(() => {
+          trace.error(error instanceof Error ? error.message : '请求失败');
+          this.diagnostics?.finish(userId, requestId, trace, 'error');
+        });
       throw error;
     }
   }

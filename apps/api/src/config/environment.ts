@@ -15,6 +15,13 @@ export interface ModelTimeouts {
   modelIdleTimeoutMs: number;
 }
 
+export function chatDebugEnabled(): boolean {
+  return (
+    process.env['CHAT_DEBUG_ENABLED'] === 'true' ||
+    (process.env['CHAT_DEBUG_ENABLED'] === undefined && process.env['NODE_ENV'] !== 'production')
+  );
+}
+
 export function getModelTimeouts(): ModelTimeouts {
   function timeout(name: string, fallback: number): number {
     const value = Number(process.env[name] ?? fallback);

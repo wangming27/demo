@@ -5,6 +5,37 @@ import { BlockList, isIP } from 'node:net';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 import { load } from 'cheerio';
 import { decode, encodingExists } from 'iconv-lite';
+import type { ChatWebRequest } from '@repo/contracts';
+
+const requestHeaders = Object.freeze({
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'User-Agent':
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  Connection: 'keep-alive',
+});
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+export function publicWebRequest(url: URL): ChatWebRequest {
+  const headers = { ...requestHeaders };
+  return {
+    requestedAt: new Date().toISOString(),
+    method: 'GET',
+    url: url.href,
+    headers,
+    curl: [
+      "curl --http1.1 --noproxy '*' --request GET --max-time 12 --compressed",
+      ...Object.entries(headers).map(
+        ([name, value]) => `--header ${shellQuote(`${name}: ${value}`)}`,
+      ),
+      `--url ${shellQuote(url.href)}`,
+    ].join(' \\\n  '),
+  };
+}
 
 const blocked = new BlockList();
 for (const [address, prefix] of [
@@ -59,23 +90,28 @@ export interface WebPage {
 }
 
 // Validate every redirect and pin DNS to public addresses before opening a socket.
-export async function readPublicPage(url: URL, signal: AbortSignal): Promise<WebPage> {
+export async function readPublicPage(
+  url: URL,
+  signal: AbortSignal,
+  onRequest?: (request: ChatWebRequest) => void,
+): Promise<WebPage> {
   const bounded = AbortSignal.any([signal, AbortSignal.timeout(12_000)]);
   let current = publicWebUrl(url.href);
   for (let redirects = 0; redirects <= 4; redirects++) {
     bounded.throwIfAborted();
+    if (onRequest) {
+      try {
+        onRequest(publicWebRequest(current));
+      } catch {
+        // Request diagnostics cannot change transport headers or stop a web request.
+      }
+    }
     const response = await new Promise<{ html?: string; location?: string }>((resolve, reject) => {
       const request = (current.protocol === 'https:' ? httpsRequest : httpRequest)(
         current,
         {
           signal: bounded,
-          headers: {
-            Accept: 'text/html,application/xhtml+xml',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          },
+          headers: requestHeaders,
           lookup: (hostname, options, callback) => {
             lookup(hostname, { all: true, family: options.family }, (error, addresses) => {
               if (error) return callback(error, []);

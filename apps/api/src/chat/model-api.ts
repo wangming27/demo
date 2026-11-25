@@ -10,6 +10,7 @@ import type { ChatTrace } from './chat-trace';
 import type { ModelObserver } from './chat-progress';
 import { ModelStream } from './model-stream';
 import type { ChatRecording } from './chat-recording';
+import type { AgentScope } from './agents/agent-types';
 import { getModelTimeouts } from '../config/environment';
 
 const blocked = new BlockList();
@@ -113,6 +114,41 @@ export interface ModelTool {
   function: { name: string; description: string; parameters: Record<string, unknown> };
 }
 
+function upstreamErrorMessage(
+  status: number | undefined,
+  body: string,
+  apiKey: string,
+  hasImages: boolean,
+): string {
+  if (status === 401 || status === 403) return '模型 API 鉴权失败，请检查 API Key';
+  if (status === 429) return '模型 API 请求过于频繁，请稍后重试';
+  let detail = '';
+  try {
+    const parsed = z
+      .object({
+        error: z.union([z.string(), z.object({ message: z.string() })]).optional(),
+        message: z.string().optional(),
+      })
+      .parse(JSON.parse(body));
+    detail =
+      (typeof parsed.error === 'string' ? parsed.error : parsed.error?.message) ??
+      parsed.message ??
+      '';
+  } catch {
+    // HTML and unrecognized upstream bodies are not useful diagnostics.
+  }
+  if (apiKey) detail = detail.split(apiKey).join('[已隐藏]');
+  detail = detail
+    .replace(/Bearer\s+\S+/gi, 'Bearer [已隐藏]')
+    .replace(/\p{Cc}+/gu, ' ')
+    .trim()
+    .slice(0, 500);
+  if (detail) return `模型 API 请求失败（HTTP ${status ?? '未知'}）：${detail}`;
+  return hasImages && status === 400
+    ? '模型无法处理图片，请确认所选模型支持视觉输入且推理服务版本支持该模型'
+    : `模型 API 请求失败（HTTP ${status ?? '未知'}），请检查地址、模型名称和请求格式`;
+}
+
 export function toModelMessages(messages: ChatMessage[]): ModelMessage[] {
   return messages.map((message) => ({
     role: message.role,
@@ -175,8 +211,10 @@ export async function callModelTurn(
   round = 1,
   observer?: ModelObserver,
   recording?: ChatRecording,
+  scope?: AgentScope,
 ): Promise<ModelTurn> {
-  await recording?.replyStart(round);
+  signal.throwIfAborted();
+  await recording?.replyStart(round, scope);
   try {
     const observed = observer
       ? {
@@ -199,11 +237,13 @@ export async function callModelTurn(
       trace,
       round,
       observed,
+      scope,
     );
-    await recording?.replyEnd(round, turn);
+    await recording?.replyEnd(round, turn, scope);
     return turn;
   } catch (error) {
     await recording?.replyError(round, error);
+    trace?.error(error instanceof Error ? error.message : '模型请求失败', scope, round);
     throw error;
   }
 }
@@ -219,10 +259,15 @@ async function requestModelTurn(
   trace?: ChatTrace,
   round = 1,
   observer?: ModelObserver,
+  scope?: AgentScope,
 ): Promise<ModelTurn> {
   const timeouts = getModelTimeouts();
   observer?.modelStart(round);
-  const started = trace?.modelRequest(round, messages, tools, toolChoice);
+  // Some OpenAI-compatible services reject null assistant content without tool calls.
+  const requestMessages = messages.map((message) =>
+    message.content === null ? { ...message, content: '' } : message,
+  );
+  const started = trace?.modelRequest(round, requestMessages, tools, toolChoice, scope);
   const url = modelEndpoint(baseUrl);
   const localDevelopment =
     process.env['NODE_ENV'] !== 'production' &&
@@ -233,7 +278,7 @@ async function requestModelTurn(
   }
   const payload = JSON.stringify({
     model,
-    messages,
+    messages: requestMessages,
     stream: Boolean(observer),
     ...(observer ? { stream_options: { include_usage: true } } : {}),
     ...(tools ? { tools, tool_choice: toolChoice } : {}),
@@ -294,19 +339,30 @@ async function requestModelTurn(
       (response) => {
         if (response.statusCode !== 200) {
           const status = response.statusCode;
-          fail(
-            new BadGatewayException(
-              status === 401 || status === 403
-                ? '模型 API 鉴权失败，请检查 API Key'
-                : status === 429
-                  ? '模型 API 请求过于频繁，请稍后重试'
-                  : hasImages && status === 400
-                    ? '模型无法处理图片，请确认所选模型支持视觉输入且推理服务版本支持该模型'
-                    : tools && status === 400
-                      ? '模型不支持联网工具调用或请求无效，请关闭联网搜索重试'
-                      : '模型 API 请求失败，请检查地址和模型名称',
-            ),
-          );
+          const errorChunks: Buffer[] = [];
+          let errorBytes = 0;
+          const rejectResponse = () =>
+            fail(
+              new BadGatewayException(
+                upstreamErrorMessage(
+                  status,
+                  Buffer.concat(errorChunks).toString('utf8'),
+                  apiKey,
+                  hasImages,
+                ),
+              ),
+            );
+          response.on('data', (chunk: Buffer) => {
+            if (settled) return;
+            errorBytes += chunk.length;
+            if (errorBytes > 16 * 1024) {
+              rejectResponse();
+              return;
+            }
+            errorChunks.push(chunk);
+          });
+          response.on('end', rejectResponse);
+          response.on('error', rejectResponse);
           return;
         }
         const chunks: Buffer[] = [];
@@ -373,7 +429,7 @@ async function requestModelTurn(
     waitForOutput(true);
     request.end(payload);
   });
-  if (started !== undefined) trace?.modelResponse(round, started, turn);
+  if (started !== undefined) trace?.modelResponse(round, started, turn, scope);
   observer?.modelEnd();
   return turn;
 }

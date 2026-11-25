@@ -90,11 +90,27 @@ const debugMessage = z.object({
   toolCalls: z.array(debugToolCall).optional(),
 });
 const debugEventFields = {
-  round: z.number().int().min(1).max(4),
+  round: z.number().int().min(1).max(150),
+  agent: z.string().max(100).optional(),
+  parentToolCallId: z.string().max(200).optional(),
   startedAt: timestamp,
   durationMs: z.number().nonnegative(),
   truncated: z.boolean(),
 };
+export const ChatWebRequestSchema = z.object({
+  requestedAt: timestamp,
+  method: z.literal('GET'),
+  url: z.string().url().max(2048),
+  headers: z.object({
+    Accept: z.string(),
+    'Accept-Language': z.string(),
+    'Accept-Encoding': z.string(),
+    'User-Agent': z.string(),
+    Connection: z.string().optional(),
+  }),
+  curl: z.string().max(8192),
+});
+export type ChatWebRequest = z.output<typeof ChatWebRequestSchema>;
 export const ChatDebugEventSchema = z.discriminatedUnion('kind', [
   z.object({
     ...debugEventFields,
@@ -112,6 +128,8 @@ export const ChatDebugEventSchema = z.discriminatedUnion('kind', [
     arguments: z.string(),
     result: z.string(),
     warning: z.string().optional(),
+    webRequests: z.array(ChatWebRequestSchema).max(5).optional(),
+    cacheHit: z.boolean().optional(),
   }),
   z.object({ ...debugEventFields, kind: z.literal('error'), message: z.string() }),
 ]);
@@ -121,7 +139,8 @@ export const ChatDebugTraceSchema = z.object({
   durationMs: z.number().nonnegative(),
   status: z.enum(['success', 'error']),
   model: z.object({ name: z.string(), model: z.string(), baseUrl: z.string() }),
-  events: z.array(ChatDebugEventSchema).max(32),
+  events: z.array(ChatDebugEventSchema).max(768),
+  truncated: z.boolean().optional(),
 });
 export type ChatDebugTrace = z.output<typeof ChatDebugTraceSchema>;
 export type ChatDebugEvent = z.output<typeof ChatDebugEventSchema>;
@@ -129,7 +148,6 @@ export const ErrorResponseSchema = z.object({
   message: z.union([z.string(), z.array(z.string())]),
   statusCode: z.number().int().optional(),
   error: z.string().optional(),
-  debug: ChatDebugTraceSchema.optional(),
 });
 
 const modelFields = {
@@ -226,7 +244,6 @@ export const ChatCompletionSchema = z
     retryOfHistoryId: z.string().uuid().optional(),
     messages: z.array(ChatMessageSchema).min(1).max(50),
     webSearch: z.boolean().optional(),
-    debug: z.boolean().optional(),
   })
   .strict()
   .refine(
@@ -278,7 +295,6 @@ export const ChatCompletionResponseSchema = z.object({
     .max(20)
     .optional(),
   searchWarning: z.string().min(1).max(1000).optional(),
-  debug: ChatDebugTraceSchema.optional(),
 });
 export type ChatModel = z.output<typeof ChatModelSchema>;
 export type CreateChatModel = z.input<typeof CreateChatModelSchema>;
@@ -325,9 +341,10 @@ export const ChatHistoryPageSchema = z.object({
 });
 export type ChatHistoryEntry = z.output<typeof ChatHistoryEntrySchema>;
 export type ChatHistoryPage = z.output<typeof ChatHistoryPageSchema>;
+
 const duration = z.number().finite().nonnegative();
 const span = z.object({
-  round: z.number().int().min(1).max(4),
+  round: z.number().int().min(1).max(150),
   startMs: duration,
   endMs: duration.nullable(),
 });
@@ -335,14 +352,14 @@ export const ChatTimingSchema = z.object({
   elapsedMs: duration,
   firstResponseMs: duration.nullable(),
   phase: z.enum(['waiting', 'thinking', 'answering', 'tool', 'finishing', 'done']),
-  thoughts: z.array(span).max(32),
-  tools: z.array(span.extend({ id: z.string(), name: z.string() })).max(4),
+  thoughts: z.array(span).max(150),
+  tools: z.array(span.extend({ id: z.string(), name: z.string() })).max(360),
 });
 export const ChatStreamEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('state'), timing: ChatTimingSchema }),
   z.object({
     type: z.literal('delta'),
-    round: z.number().int().min(1).max(4),
+    round: z.number().int().min(1).max(150),
     reasoning: z.string().max(100_000).optional(),
     content: z.string().max(100_000).optional(),
     toolCall: z.boolean().optional(),
@@ -356,7 +373,6 @@ export const ChatStreamEventSchema = z.discriminatedUnion('type', [
     type: z.literal('error'),
     message: z.string(),
     status: z.number().int(),
-    debug: ChatDebugTraceSchema.optional(),
     timing: ChatTimingSchema,
   }),
 ]);

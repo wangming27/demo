@@ -3,20 +3,25 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
+import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import { mkdir, rm, utimes } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { test } from 'node:test';
 import { PrismaPg } from '@prisma/adapter-pg';
 import prismaConfig from '../prisma.config.mjs';
-
 const require = createRequire(import.meta.url);
+const { publicWebRequest } = require('../.test-dist/chat/public-web.js');
 const { PrismaClient } = require('../.test-dist/generated/prisma/client.js');
 const { ChatService } = require('../.test-dist/chat/chat.service.js');
+const { ChatController } = require('../.test-dist/chat/chat.controller.js');
+const { ChatDebugStore } = require('../.test-dist/chat-debug/chat-debug.module.js');
 const { ChatHistoryService } = require('../.test-dist/chat/chat-history.service.js');
 const { ChatStorageService } = require('../.test-dist/chat/chat-storage.service.js');
 const { ChatAgentService } = require('../.test-dist/chat/chat-agent.service.js');
 const { ChatProgress } = require('../.test-dist/chat/chat-progress.js');
+const { ResearchAgentService } = require('../.test-dist/chat/agents/research-agent.service.js');
+const { SubAgentRegistry } = require('../.test-dist/chat/agents/sub-agent-registry.service.js');
 
 test(
   'chat history persists rounds, resources, failures and request identity',
@@ -78,8 +83,22 @@ test(
       const toolResult = {
         data: { pages: ['文'.repeat(140_000)] },
         sources: [{ title: '来源', url: 'https://example.com/news' }],
+        debug: {
+          webRequests: [publicWebRequest(new URL('https://example.com/news'))],
+          cacheHit: false,
+        },
       };
-      const agent = new ChatAgentService({ execute: async () => toolResult });
+      const agent = new ChatAgentService({
+        tools: () => [
+          {
+            definition: {
+              type: 'function',
+              function: { name: 'research', description: '研究', parameters: {} },
+            },
+            execute: async () => toolResult,
+          },
+        ],
+      });
       const service = new ChatService(prisma, agent, histories);
       const input = (extra = {}) => ({
         modelId: config.id,
@@ -189,6 +208,8 @@ test(
         async () => {
           handler = (body, res) => {
             const round = body.messages.filter((message) => message.role === 'tool').length;
+            for (const message of body.messages.filter((message) => message.role === 'tool'))
+              assert.equal('debug' in JSON.parse(message.content), false);
             res.end(
               JSON.stringify({
                 choices: [
@@ -203,7 +224,7 @@ test(
                               {
                                 id: `call-${round}`,
                                 type: 'function',
-                                function: { name: 'web_search', arguments: '{"query":"新闻"}' },
+                                function: { name: 'research', arguments: '{"task":"查证新闻"}' },
                               },
                             ],
                           },
@@ -233,14 +254,243 @@ test(
           assert.equal(detail.replies[2].reasoningContent, 'SECRET_THOUGHT');
           assert.equal(detail.history.contextUsedTokens, 252);
           const tool = detail.toolCalls[0];
-          assert.equal(tool.argumentsRaw, '{"query":"新闻"}');
-          assert.deepEqual(tool.arguments, { query: '新闻' });
+          assert.equal(tool.argumentsRaw, '{"task":"查证新闻"}');
+          assert.deepEqual(tool.arguments, { task: '查证新闻' });
           const file = await histories.resource(user.id, answer.historyId, tool.resources[0].id);
           assert.deepEqual(JSON.parse(file.data.toString()), toolResult);
+          assert.equal(
+            JSON.parse(file.data.toString()).debug.webRequests[0].curl,
+            toolResult.debug.webRequests[0].curl,
+          );
           const count = requests;
           const replay = await service.complete(user.id, body, signal());
           assert.deepEqual(replay.sources, answer.sources);
           assert.equal(requests, count);
+        },
+      );
+      await t.test(
+        'research rounds persist scope and only selected evidence becomes history citations',
+        async () => {
+          const quote = '北京今日天气晴朗，空气质量良好，适合安排户外活动。';
+          let round = 0;
+          handler = (body, res) => {
+            round++;
+            const call = (name, args, id) => ({
+              id,
+              type: 'function',
+              function: { name, arguments: JSON.stringify(args) },
+            });
+            const message =
+              round === 1
+                ? { tool_calls: [call('research', { task: '查证北京天气' }, 'delegate')] }
+                : round === 2
+                  ? {
+                      tool_calls: [
+                        call('web_fetch', { url: 'https://example.com/relevant' }, 'relevant'),
+                        call('web_fetch', { url: 'https://example.com/unrelated' }, 'unrelated'),
+                      ],
+                    }
+                  : round === 3
+                    ? {
+                        content: JSON.stringify({
+                          findings: [
+                            {
+                              claim: '北京适宜出门',
+                              evidence: [{ url: 'https://example.com/relevant', quote }],
+                            },
+                          ],
+                          gaps: [],
+                        }),
+                      }
+                    : { content: '最终主 Agent 回答' };
+            assert.equal(body.stream, true);
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.end(
+              frame({
+                ...message,
+                ...(message.tool_calls
+                  ? { tool_calls: message.tool_calls.map((tool, index) => ({ ...tool, index })) }
+                  : {}),
+              }) +
+                'data: {"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":10}}\n\n' +
+                'data: [DONE]\n\n',
+            );
+          };
+          const research = new ResearchAgentService({
+            execute: async (_name, raw) => {
+              const url = JSON.parse(raw).url;
+              return {
+                data: { title: '网页正文', url, content: quote.repeat(5) },
+                sources: [{ title: '网页正文', url }],
+              };
+            },
+          });
+          const researchService = new ChatService(
+            prisma,
+            new ChatAgentService(new SubAgentRegistry([research])),
+            histories,
+          );
+          const body = input({ webSearch: true });
+          const progress = new ChatProgress(() => {});
+          const answer = await researchService.complete(user.id, body, signal(), progress);
+          const detail = await histories.detail(user.id, answer.historyId);
+          assert.deepEqual(
+            detail.replies.map((reply) => [reply.round, reply.timings.agent, reply.isFinal]),
+            [
+              [1, 'main', false],
+              [2, 'research', false],
+              [3, 'research', false],
+              [4, 'main', true],
+            ],
+          );
+          assert.equal(detail.replies[1].timings.parentToolCallId, '1:delegate');
+          assert.deepEqual(
+            detail.toolCalls.map((tool) => tool.sequence),
+            [2, 4, 5],
+          );
+          const feed = await histories.feed(user.id);
+          const item = feed.items.find((entry) => entry.id === answer.historyId);
+          assert.equal(item.reply.content, '最终主 Agent 回答');
+          assert.deepEqual(item.sources, [
+            { title: '网页正文', url: 'https://example.com/relevant' },
+          ]);
+          const replay = await researchService.complete(user.id, body, signal());
+          assert.deepEqual(replay.sources, answer.sources);
+          assert.equal(round, 4);
+          assert.ok(progress.finish().tools.every((tool) => tool.endMs !== null));
+        },
+      );
+      await t.test(
+        'cancelled delegate content stays in detail and never becomes a chat reply',
+        async () => {
+          const controller = new AbortController();
+          const { journal } = await histories.begin(user.id, input(), controller.signal);
+          await journal.replyStart(1, { agent: 'main' });
+          await journal.replyEnd(
+            1,
+            {
+              content: '主 Agent 正在查证',
+              tool_calls: [
+                {
+                  id: 'delegate',
+                  type: 'function',
+                  function: { name: 'research', arguments: '{"task":"查证"}' },
+                },
+              ],
+            },
+            { agent: 'main' },
+          );
+          await journal.replyStart(2, { agent: 'research', parentToolCallId: '1:delegate' });
+          journal.delta({
+            type: 'delta',
+            round: 2,
+            content: '{"findings":"子 Agent 的部分 JSON"}',
+          });
+          controller.abort();
+          await journal.replyError(2, new Error('cancelled'));
+          await journal.finishError(new Error('cancelled'));
+          const detail = await histories.detail(user.id, journal.row.id);
+          assert.equal(detail.replies[1].timings.agent, 'research');
+          assert.match(detail.replies[1].content, /部分 JSON/);
+          const feed = await histories.feed(user.id);
+          assert.equal(
+            feed.items.find((entry) => entry.id === journal.row.id).reply.content,
+            '主 Agent 正在查证',
+          );
+        },
+      );
+      await t.test(
+        'empty research reports emit SSE errors and persist failed history and delegation',
+        async () => {
+          let rounds = 0;
+          handler = (request, res) => {
+            rounds++;
+            const message =
+              rounds === 1
+                ? {
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: 'delegate',
+                        type: 'function',
+                        function: { name: 'research', arguments: '{"task":"查证天气"}' },
+                      },
+                    ],
+                  }
+                : { content: null, reasoning_content: '正在整理报告。' };
+            if (request.stream) {
+              res.setHeader('Content-Type', 'text/event-stream');
+              res.end(frame(message, 'stop') + 'data: [DONE]\n\n');
+              return;
+            }
+            res.end(
+              JSON.stringify({
+                choices: [
+                  {
+                    finish_reason: 'stop',
+                    message,
+                  },
+                ],
+              }),
+            );
+          };
+          const research = new ResearchAgentService({
+            execute: async () => assert.fail('empty report must not publish evidence'),
+          });
+          const debugStore = new ChatDebugStore();
+          const researchService = new ChatService(
+            prisma,
+            new ChatAgentService(new SubAgentRegistry([research])),
+            histories,
+            debugStore,
+          );
+          const body = input({ webSearch: true });
+          const chunks = [];
+          const response = Object.assign(new EventEmitter(), {
+            headersSent: false,
+            destroyed: false,
+            writableLength: 0,
+            status() {
+              return this;
+            },
+            set() {
+              return this;
+            },
+            write(chunk) {
+              this.headersSent = true;
+              chunks.push(chunk);
+            },
+            end() {},
+          });
+          await new ChatController(researchService).stream({ authUser: user }, body, response);
+          const events = chunks.map((chunk) => JSON.parse(chunk.slice('data: '.length).trim()));
+          const failure = events.find((event) => event.type === 'error');
+          assert.equal(failure.status, 502);
+          assert.match(failure.message, /报告为空或格式无效/);
+          assert.equal('debug' in failure, false);
+          const debug = debugStore.get(user.id, body.requestId);
+          assert.equal(debug.status, 'error');
+          assert.ok(
+            debug.events.some(
+              (event) =>
+                event.kind === 'error' &&
+                event.agent === 'research' &&
+                event.parentToolCallId === '1:delegate',
+            ),
+          );
+          assert.equal(
+            events.some((event) => event.type === 'done'),
+            false,
+          );
+          assert.equal(rounds, 4);
+          const row = await prisma.chatHistory.findUniqueOrThrow({
+            where: { userId_requestId: { userId: user.id, requestId: body.requestId } },
+          });
+          const detail = await histories.detail(user.id, row.id);
+          assert.equal(detail.history.status, 'FAILED');
+          assert.equal(detail.toolCalls[0].status, 'FAILED');
+          assert.equal(detail.replies.length, 4);
+          assert.ok(detail.replies.slice(1).every((reply) => !reply.isFinal));
         },
       );
       await t.test(

@@ -2,6 +2,7 @@
   "extends": "@repo/typescript-config/react.json",
   "compilerOptions": {
     "composite": true,
+    "allowImportingTsExtensions": true,
     "tsBuildInfoFile": "./node_modules/.cache/tsconfig.app.tsbuildinfo",
     "types": ["vite/client"]
   },

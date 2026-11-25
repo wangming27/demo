@@ -14,6 +14,14 @@ import {
   updateUser,
 } from '../src/services/api.ts';
 import { historyMessages, contextMessages } from '../src/pages/chat/chat-history.ts';
+import { subscribeChatRequests } from '../src/services/chat-events.ts';
+import { readChatDebug } from '../src/features/chat-debug/api.ts';
+import {
+  DEFAULT_HISTORY_ROUNDS,
+  MAX_HISTORY_ROUNDS,
+  loadChatSettings,
+  saveChatSettings,
+} from '../src/pages/chat/chat-settings.ts';
 
 const user = {
   id: 'cf44a477-9d24-4ee6-96eb-4b00b89aa95e',
@@ -54,6 +62,46 @@ const timing = {
   thoughts: [],
   tools: [],
 };
+
+test('debug observers and independent reads cannot fail or delay a completed chat', async (t) => {
+  const input = { ...streamInput, requestId: user.id };
+  const observed = [];
+  let debugRead;
+  t.after(
+    subscribeChatRequests(() => {
+      throw new Error('observer failed');
+    }),
+  );
+  t.after(
+    subscribeChatRequests((event) => {
+      observed.push(event);
+      if (event.type === 'finished') {
+        debugRead = readChatDebug(event.requestId, new AbortController().signal).catch(
+          (error) => error,
+        );
+      }
+    }),
+  );
+  t.mock.method(globalThis, 'fetch', async (path, options) => {
+    if (path === `/api/chat-debug/${user.id}`) {
+      assert.equal(options.credentials, 'same-origin');
+      return new Response('debug unavailable', { status: 503 });
+    }
+    assert.equal(path, '/api/chat/stream');
+    assert.equal('debug' in JSON.parse(options.body), false);
+    return new Response(sseFrame({ type: 'done', answer: { content: '回答' }, timing }), {
+      headers: { 'Content-Type': 'text/event-stream' },
+    });
+  });
+  const result = await streamChat(input, new AbortController().signal, () => {});
+  assert.equal(result.answer.content, '回答');
+  assert.deepEqual(
+    observed.map((event) => event.type),
+    ['started', 'finished'],
+  );
+  assert.equal(observed.at(-1).status, 'success');
+  assert.match((await debugRead).message, /调试记录读取失败/);
+});
 const sseFrame = (event) => `data: ${JSON.stringify(event)}\r\n\r\n`;
 test('stream client delivers split UTF8 output before done and releases its reader', async (t) => {
   let enqueue;
@@ -384,7 +432,7 @@ test('restored chat messages are chronological, preserve partial replies and sco
   assert.equal(messages.find((message) => message.id === 'new:user').reasoning, undefined);
   const question = { role: 'user', content: '继续' };
   assert.deepEqual(
-    contextMessages(messages, 'current', question).map((message) => message.content),
+    contextMessages(messages, 'current', question, 24).map((message) => message.content),
     ['旧问题', '旧回答', '新问题', '新回答'],
   );
   const long = historyMessages(
@@ -392,7 +440,7 @@ test('restored chat messages are chronological, preserve partial replies and sco
       item(String(index), 'current', '问'.repeat(1000), '答'.repeat(1000)),
     ),
   );
-  const context = contextMessages(long, 'current', question);
+  const context = contextMessages(long, 'current', question, 24);
   assert.equal(context.length, 48);
   assert.ok(
     context.reduce((total, message) => total + message.content.length, question.content.length) <=
@@ -406,6 +454,116 @@ test('restored chat messages are chronological, preserve partial replies and sco
   const imageMessages = historyMessages([imageRow]);
   assert.equal(imageMessages[0].historyImages[0].historyId, 'new');
   assert.equal(imageMessages[0].historyImages[0].bytes, 2 * 1024 * 1024);
+});
+
+test('configured history rounds select only the latest complete turns of the current conversation', () => {
+  const turn = (id, conversationId = 'current', historyEligible = true) => [
+    { id: `${id}:user`, role: 'user', content: `问${id}`, conversationId, historyEligible },
+    {
+      id: `${id}:assistant`,
+      role: 'assistant',
+      content: `答${id}`,
+      conversationId,
+      historyEligible,
+    },
+  ];
+  const messages = [
+    ...turn('1'),
+    ...turn('other', 'other'),
+    ...turn('2'),
+    ...turn('failed', 'current', false),
+    ...turn('3'),
+  ];
+  const question = { role: 'user', content: '现在的问题' };
+  assert.deepEqual(contextMessages(messages, 'current', question, 0), []);
+  assert.deepEqual(
+    contextMessages(messages, 'current', question, 1).map((message) => message.content),
+    ['问3', '答3'],
+  );
+  assert.deepEqual(
+    contextMessages(messages, 'current', question, 2).map((message) => message.content),
+    ['问2', '答2', '问3', '答3'],
+  );
+  assert.equal(contextMessages(messages, 'current', question, MAX_HISTORY_ROUNDS).length, 6);
+  assert.deepEqual(
+    contextMessages([...messages, turn('incomplete')[0]], 'current', question, 2),
+    [],
+  );
+  for (const invalid of [-1, 1.5, MAX_HISTORY_ROUNDS + 1, NaN, Infinity, '2', undefined])
+    assert.deepEqual(contextMessages(messages, 'current', question, invalid), []);
+});
+
+test('configured history still respects text and image budgets without including older turns instead', () => {
+  const turn = (id, content = '问题', historyImages = []) => [
+    { id: `${id}:user`, role: 'user', content, conversationId: 'current', historyImages },
+    { id: `${id}:assistant`, role: 'assistant', content: '回答', conversationId: 'current' },
+  ];
+  const messages = [...turn('old'), ...turn('new', '问'.repeat(16_001))];
+  const question = { role: 'user', content: '继续' };
+  assert.deepEqual(contextMessages(messages, 'current', question, 2), []);
+  const withImages = [
+    ...turn('old', '旧问题', [{ bytes: 6 * 1024 * 1024 }]),
+    ...turn('new', '新问题', [{ bytes: 4 * 1024 * 1024 }]),
+  ];
+  assert.deepEqual(
+    contextMessages(withImages, 'current', question, 2).map((message) => message.id),
+    ['new:user', 'new:assistant'],
+  );
+  assert.deepEqual(contextMessages(withImages, 'current', question, 0), []);
+  const long = Array.from({ length: MAX_HISTORY_ROUNDS }, (_, index) =>
+    turn(String(index), '问'.repeat(16_000)),
+  ).flat();
+  assert.equal(contextMessages(long, 'current', question, MAX_HISTORY_ROUNDS).length, 6);
+});
+
+test('conversation settings persist per user, preserve zero and recover from invalid or blocked storage', (t) => {
+  const data = new Map();
+  const storage = {
+    getItem: (key) => data.get(key) ?? null,
+    setItem: (key, value) => data.set(key, value),
+  };
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete globalThis.localStorage;
+  });
+
+  assert.equal(loadChatSettings('first').historyRounds, DEFAULT_HISTORY_ROUNDS);
+  assert.equal(saveChatSettings('first', { historyRounds: 3 }), true);
+  assert.deepEqual(loadChatSettings('first'), { historyRounds: 3 });
+  assert.equal(loadChatSettings('second').historyRounds, DEFAULT_HISTORY_ROUNDS);
+  assert.equal(saveChatSettings('second', { historyRounds: MAX_HISTORY_ROUNDS }), true);
+  assert.equal(saveChatSettings('first', { historyRounds: 0 }), true);
+  assert.deepEqual(loadChatSettings('first'), { historyRounds: 0 });
+  assert.deepEqual(loadChatSettings('second'), { historyRounds: MAX_HISTORY_ROUNDS });
+
+  for (const invalid of [-1, 1.5, MAX_HISTORY_ROUNDS + 1, NaN, Infinity, '2', null]) {
+    assert.equal(saveChatSettings('first', { historyRounds: invalid }), false);
+    assert.deepEqual(loadChatSettings('first'), { historyRounds: 0 });
+  }
+  for (const raw of [
+    'invalid json',
+    'null',
+    '[]',
+    '3',
+    '{}',
+    '{"historyRounds":-1}',
+    '{"historyRounds":1.5}',
+    '{"historyRounds":25}',
+    '{"historyRounds":"3"}',
+  ]) {
+    data.set('chat-settings:first', raw);
+    assert.equal(loadChatSettings('first').historyRounds, DEFAULT_HISTORY_ROUNDS);
+  }
+  t.mock.method(storage, 'getItem', () => {
+    throw new Error('storage access denied');
+  });
+  t.mock.method(storage, 'setItem', () => {
+    throw new Error('storage quota exceeded');
+  });
+  assert.equal(loadChatSettings('first').historyRounds, DEFAULT_HISTORY_ROUNDS);
+  assert.equal(saveChatSettings('first', { historyRounds: 2 }), false);
 });
 
 test('chat client preserves image data and image-only messages in the request', async (t) => {
@@ -425,7 +583,6 @@ test('chat client preserves image data and image-only messages in the request', 
       },
     ],
     webSearch: true,
-    debug: true,
   };
   t.mock.method(globalThis, 'fetch', (_path, options) => {
     assert.deepEqual(JSON.parse(options.body), input);
@@ -434,8 +591,8 @@ test('chat client preserves image data and image-only messages in the request', 
   assert.equal((await sendChat(input, new AbortController().signal)).content, '图片回答');
 });
 
-test('chat preserves debug records on success and on upstream failure', async (t) => {
-  const input = { modelId: user.id, messages: [{ role: 'user', content: '调试' }], debug: true };
+test('chat excludes legacy debug records on success and upstream failure', async (t) => {
+  const input = { modelId: user.id, messages: [{ role: 'user', content: '调试' }] };
   const debug = {
     requestId: user.id,
     startedAt: user.createdAt,
@@ -452,13 +609,39 @@ test('chat preserves debug records on success and on upstream failure', async (t
         messages: input.messages,
         tools: '[]',
       },
+      {
+        kind: 'tool',
+        round: 1,
+        startedAt: user.createdAt,
+        durationMs: 20,
+        truncated: false,
+        toolCallId: 'search',
+        name: 'web_search',
+        arguments: '{"query":"杭州天气"}',
+        result: '{"results":[]}',
+        cacheHit: true,
+        webRequests: [
+          {
+            requestedAt: user.createdAt,
+            method: 'GET',
+            url: 'https://cn.bing.com/search?q=weather',
+            headers: {
+              Accept: 'text/html',
+              'Accept-Language': 'zh-CN',
+              'Accept-Encoding': 'gzip, deflate, br',
+              'User-Agent': 'test-browser',
+            },
+            curl: "curl --url 'https://cn.bing.com/search?q=weather'",
+          },
+        ],
+      },
     ],
   };
   const success = t.mock.method(globalThis, 'fetch', (_path, options) => {
     assert.deepEqual(JSON.parse(options.body), input);
     return Promise.resolve(json({ content: '回答', debug }));
   });
-  assert.deepEqual((await sendChat(input, new AbortController().signal)).debug, debug);
+  assert.equal('debug' in (await sendChat(input, new AbortController().signal)), false);
   success.mock.restore();
   const failed = { ...debug, status: 'error' };
   t.mock.method(globalThis, 'fetch', () =>
@@ -467,7 +650,7 @@ test('chat preserves debug records on success and on upstream failure', async (t
   await assert.rejects(sendChat(input, new AbortController().signal), (error) => {
     assert.equal(error instanceof ApiError, true);
     assert.equal(error.status, 502);
-    assert.deepEqual(error.debug, failed);
+    assert.equal('debug' in error, false);
     return true;
   });
 });

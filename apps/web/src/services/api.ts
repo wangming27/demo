@@ -1,9 +1,4 @@
-import {
-  apiContract,
-  ChatDebugTraceSchema,
-  ChatStreamEventSchema,
-  SseDecoder,
-} from '@repo/contracts';
+import { apiContract, ChatStreamEventSchema, SseDecoder } from '@repo/contracts';
 import type {
   Credentials,
   HealthResponse,
@@ -18,11 +13,11 @@ import type {
   UpdateChatModel,
   ChatCompletion,
   ChatCompletionResponse,
-  ChatDebugTrace,
   ChatStreamEvent,
   ChatHistoryPage,
 } from '@repo/contracts';
 import { initClient, ResponseValidationError, validateResponse } from '@ts-rest/core';
+import { publishChatRequest } from './chat-events.ts';
 
 export type {
   Credentials,
@@ -49,7 +44,6 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
-    readonly debug?: ChatDebugTrace,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -93,14 +87,7 @@ const client = initClient(apiContract, {
       }
     }
     if (!response.ok) {
-      const debug = ChatDebugTraceSchema.safeParse(
-        typeof data === 'object' && data !== null && 'debug' in data ? data.debug : undefined,
-      );
-      throw new ApiError(
-        errorMessage(data, response.status),
-        response.status,
-        debug.success ? debug.data : undefined,
-      );
+      throw new ApiError(errorMessage(data, response.status), response.status);
     }
     const validated = validateResponse({
       appRoute: args.route,
@@ -300,6 +287,29 @@ export async function streamChat(
   signal: AbortSignal,
   onEvent: (event: ChatStreamEvent) => void,
 ): Promise<Extract<ChatStreamEvent, { type: 'done' }>> {
+  const requestId = input.requestId;
+  if (requestId) publishChatRequest({ type: 'started', requestId, input });
+  try {
+    const result = await receiveChat(input, signal, onEvent);
+    if (requestId) publishChatRequest({ type: 'finished', requestId, status: 'success' });
+    return result;
+  } catch (error) {
+    if (requestId)
+      publishChatRequest({
+        type: 'finished',
+        requestId,
+        status: signal.aborted ? 'cancelled' : 'error',
+        error: error instanceof Error ? error.message : '发送失败',
+      });
+    throw error;
+  }
+}
+
+async function receiveChat(
+  input: ChatCompletion,
+  signal: AbortSignal,
+  onEvent: (event: ChatStreamEvent) => void,
+): Promise<Extract<ChatStreamEvent, { type: 'done' }>> {
   const response = await fetch(apiContract.chat.stream.path, {
     method: 'POST',
     credentials: 'same-origin',
@@ -337,7 +347,7 @@ export async function streamChat(
           throw new Error('服务返回了无效的流式数据');
         }
         onEvent(event);
-        if (event.type === 'error') throw new ApiError(event.message, event.status, event.debug);
+        if (event.type === 'error') throw new ApiError(event.message, event.status);
         if (event.type === 'done') return event;
       }
       if (done) throw new Error('连接中断，未收到完整回复');

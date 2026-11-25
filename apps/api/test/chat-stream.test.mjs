@@ -123,6 +123,31 @@ async function upstream(t, handler) {
   };
 }
 
+test('nested research and fetch intervals close independently and finish closes pending delegates', () => {
+  let now = 0;
+  const progress = new ChatProgress(
+    () => {},
+    () => now,
+  );
+  progress.toolStart(1, '1:delegate', 'research');
+  now = 100;
+  progress.toolStart(2, '2:fetch', 'web_fetch');
+  now = 300;
+  progress.toolEnd('2:fetch');
+  assert.equal(progress.snapshot().phase, 'tool');
+  assert.equal(progress.snapshot().tools[0].endMs, null);
+  assert.equal(progress.snapshot().tools[1].endMs, 300);
+  now = 500;
+  progress.toolEnd('1:delegate');
+  assert.equal(progress.snapshot().tools[0].endMs, 500);
+  assert.equal(progress.snapshot().tools[1].endMs, 300);
+  assert.equal(progress.snapshot().phase, 'finishing');
+  progress.toolStart(3, '3:delegate', 'research');
+  progress.toolStart(4, '4:fetch', 'web_fetch');
+  now = 800;
+  assert.ok(progress.finish().tools.every((tool) => tool.endMs !== null));
+});
+
 test('streaming agent emits output before completion and retains multiple thought/tool rounds', async (t) => {
   let round = 0;
   let release;
@@ -143,7 +168,7 @@ test('streaming agent emits output before completion and retains multiple though
               index: 0,
               id: 'call-1',
               type: 'function',
-              function: { name: 'web_search', arguments: '{"query":"天气"}' },
+              function: { name: 'research', arguments: '{"task":"查证天气"}' },
             },
           ],
         }) + 'data: [DONE]\n\n',
@@ -167,10 +192,18 @@ test('streaming agent emits output before completion and retains multiple though
     if (event.type === 'delta' && event.content) partial();
   });
   const agent = new ChatAgentService({
-    execute: async () => ({
-      data: { result: '资料' },
-      sources: [{ title: '来源', url: 'https://example.com' }],
-    }),
+    tools: () => [
+      {
+        definition: {
+          type: 'function',
+          function: { name: 'research', description: '研究', parameters: {} },
+        },
+        execute: async () => ({
+          data: { result: '资料' },
+          sources: [{ title: '来源', url: 'https://example.com' }],
+        }),
+      },
+    ],
   });
   let settled = false;
   const pending = agent
@@ -255,4 +288,92 @@ test('stream transport rejects truncation and JSON fallback, and abort closes up
   controller.abort();
   await assert.rejects(pending);
   await disconnected;
+});
+
+test('transport normalizes null content without mutating messages or removing tool metadata', async (t) => {
+  const messages = [
+    { role: 'user', content: '查证天气' },
+    { role: 'assistant', content: null, reasoning_content: '先查询。' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'lookup',
+          type: 'function',
+          function: { name: 'lookup', arguments: '{}' },
+        },
+      ],
+    },
+    { role: 'tool', tool_call_id: 'lookup', content: '{}' },
+  ];
+  const original = structuredClone(messages);
+  const model = await upstream(t, (body, response) => {
+    assert.equal(body.messages[1].content, '');
+    assert.equal(body.messages[1].reasoning_content, '先查询。');
+    assert.equal(body.messages[2].content, '');
+    assert.deepEqual(body.messages[2].tool_calls, messages[2].tool_calls);
+    assert.deepEqual(body.messages[3], messages[3]);
+    response.end(JSON.stringify({ choices: [{ message: { content: '回答' } }] }));
+  });
+  const turn = await callModelTurn(
+    model.baseUrl,
+    model.apiKey,
+    model.model,
+    messages,
+    new AbortController().signal,
+  );
+  assert.equal(turn.content, '回答');
+  assert.deepEqual(messages, original);
+});
+
+test('upstream errors preserve bounded reasons and redact credentials in recorded failures', async (t) => {
+  for (const [status, body, expected] of [
+    [
+      400,
+      JSON.stringify({
+        error: { message: 'invalid message content type: <nil>; fixture; Bearer other-secret' },
+      }),
+      /HTTP 400.*invalid message content type: <nil>/,
+    ],
+    [401, '{"error":{"message":"fixture secret"}}', /鉴权失败/],
+    [429, '{"error":"fixture secret"}', /过于频繁/],
+    [500, '<html>fixture secret</html>', /HTTP 500/],
+    [400, JSON.stringify({ error: 'x'.repeat(1000) }), /HTTP 400/],
+    [400, JSON.stringify({ error: 'x'.repeat(20_000) }), /HTTP 400/],
+  ]) {
+    const model = await upstream(t, (_request, response) => {
+      response.writeHead(status, { 'Content-Type': 'application/json' });
+      response.end(body);
+    });
+    const recorded = [];
+    const traced = [];
+    await assert.rejects(
+      callModelTurn(
+        model.baseUrl,
+        model.apiKey,
+        model.model,
+        [],
+        new AbortController().signal,
+        [],
+        'auto',
+        { modelRequest() {}, error: (message) => traced.push(message) },
+        1,
+        undefined,
+        {
+          replyStart: async () => {},
+          replyError: async (_round, error) => recorded.push(error.message),
+        },
+      ),
+      (error) => {
+        assert.equal(error.getStatus(), 502);
+        assert.match(error.message, expected);
+        assert.doesNotMatch(error.message, /fixture|other-secret|不支持联网工具/);
+        assert.ok(error.message.length < 600);
+        assert.deepEqual(recorded, [error.message]);
+        assert.deepEqual(traced, [error.message]);
+        return true;
+      },
+    );
+  }
 });

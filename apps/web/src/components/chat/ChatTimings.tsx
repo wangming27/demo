@@ -17,6 +17,16 @@ const phases = {
   finishing: '整理回复',
   done: '已结束',
 };
+const toolLabels: Record<string, string> = {
+  research: '资料查证',
+  web_search: '联网搜索',
+  web_fetch: '网页读取',
+};
+const toolStatuses: Record<string, string> = {
+  research: '正在查证资料',
+  web_search: '正在搜索',
+  web_fetch: '正在读取网页',
+};
 export default function ChatTimings({ timing }: { timing: DisplayTiming }) {
   const [now, setNow] = useState(() => performance.now());
   useEffect(() => {
@@ -30,14 +40,14 @@ export default function ChatTimings({ timing }: { timing: DisplayTiming }) {
       : timing.server.elapsedMs;
   const spanTime = (span: { startMs: number; endMs: number | null }) =>
     seconds(Math.max(0, (span.endMs ?? current) - span.startMs));
-  const searching =
-    timing.server.phase === 'tool' &&
-    timing.server.tools.some((span) => span.name === 'web_search' && span.endMs === null);
+  const activeTool = [...timing.server.tools].reverse().find((span) => span.endMs === null);
+  const status =
+    timing.server.phase === 'tool' && activeTool
+      ? (toolStatuses[activeTool.name] ?? phases.tool)
+      : phases[timing.server.phase];
   return (
     <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 border-t border-line pt-3 text-xs text-muted">
-      {timing.totalMs === null && (
-        <span role="status">{searching ? '正在搜索' : phases[timing.server.phase]}</span>
-      )}
+      {timing.totalMs === null && <span role="status">{status}</span>}
       <span>
         首响应：{timing.firstResponseMs === null ? '等待中' : seconds(timing.firstResponseMs)}
       </span>
@@ -50,7 +60,7 @@ export default function ChatTimings({ timing }: { timing: DisplayTiming }) {
       {timing.server.tools.length === 0 && <span>工具：未调用</span>}
       {timing.server.tools.map((span, index) => (
         <span key={index}>
-          工具 {index + 1} · {span.name === 'web_search' ? '联网搜索' : span.name}：{spanTime(span)}
+          工具 {index + 1} · {toolLabels[span.name] ?? span.name}：{spanTime(span)}
         </span>
       ))}
       <span>总耗时：{seconds(timing.totalMs ?? Math.max(0, now - timing.started))}</span>

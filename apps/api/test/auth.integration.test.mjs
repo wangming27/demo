@@ -745,6 +745,11 @@ test('chat configuration ownership and model proxy', async (t) => {
   }
   let first;
   let second;
+  function debugRequest(requestId, currentCookie = ownerCookie) {
+    return fetch(`${baseUrl}/api/chat-debug/${requestId}`, {
+      headers: currentCookie ? { Cookie: currentCookie } : {},
+    });
+  }
 
   await t.test('requires session and trusted origin, validates configuration', async () => {
     const streamBody = { modelId: randomUUID(), messages: [{ role: 'user', content: '测试' }] };
@@ -828,7 +833,7 @@ test('chat configuration ownership and model proxy', async (t) => {
       const body = {
         modelId: first.id,
         messages: [{ role: 'user', content: '你好' }],
-        debug: true,
+        requestId: randomUUID(),
       };
       assert.equal((await chat('/stream', 'POST', body, otherCookie)).status, 404);
       const { SseDecoder, ChatStreamEventSchema } = require('@repo/contracts');
@@ -848,7 +853,8 @@ test('chat configuration ownership and model proxy', async (t) => {
       assert.equal(done.answer.content, '流式回答');
       assert.equal(done.timing.thoughts.length, 1);
       assert.equal(done.timing.phase, 'done');
-      assert.equal(done.answer.debug.status, 'success');
+      assert.equal('debug' in done.answer, false);
+      assert.equal((await (await debugRequest(body.requestId)).json()).status, 'success');
       const feedResponse = await chat('/histories/feed');
       assert.equal(feedResponse.status, 200);
       const feed = await feedResponse.json();
@@ -860,14 +866,16 @@ test('chat configuration ownership and model proxy', async (t) => {
       assert.equal(received.body.stream, true);
       assert.equal(received.body.messages[0].content.length, 10_000);
       streamMode = 'truncated';
-      const failed = await chat('/stream', 'POST', body);
+      const failedRequestId = randomUUID();
+      const failed = await chat('/stream', 'POST', { ...body, requestId: failedRequestId });
       const failedEvents = new SseDecoder()
         .push(await failed.text())
         .map((data) => ChatStreamEventSchema.parse(JSON.parse(data)));
       assert.equal(failed.status, 200);
       assert.equal(failedEvents.at(-1).type, 'error');
       assert.equal(failedEvents.at(-1).status, 502);
-      assert.equal(failedEvents.at(-1).debug.status, 'error');
+      assert.equal('debug' in failedEvents.at(-1), false);
+      assert.equal((await (await debugRequest(failedRequestId)).json()).status, 'error');
       assert.equal(
         failedEvents.some((event) => event.type === 'done'),
         false,
@@ -904,13 +912,17 @@ test('chat configuration ownership and model proxy', async (t) => {
   });
   await t.test('debug records actual plain model history without credentials', async () => {
     const messages = [{ role: 'user', content: '请展示调用记录' }];
+    const requestId = randomUUID();
     const response = await chat('/completions', 'POST', {
       modelId: first.id,
       messages,
-      debug: true,
+      requestId,
     });
     assert.equal(response.status, 200);
-    const { debug } = await response.json();
+    assert.equal('debug' in (await response.json()), false);
+    const debug = await (await debugRequest(requestId)).json();
+    assert.equal((await debugRequest(requestId, otherCookie)).status, 404);
+    assert.equal((await debugRequest(requestId, '')).status, 401);
     assert.equal(debug.status, 'success');
     assert.deepEqual(
       debug.events.map((event) => event.kind),
@@ -973,10 +985,11 @@ test('chat configuration ownership and model proxy', async (t) => {
         dataUrl:
           'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
       };
+      const requestId = randomUUID();
       const response = await chat('/completions', 'POST', {
         modelId: first.id,
         messages: [{ role: 'user', content: '', images: [image] }],
-        debug: true,
+        requestId,
       });
       assert.equal(response.status, 200);
       const answer = await response.json();
@@ -1016,8 +1029,9 @@ test('chat configuration ownership and model proxy', async (t) => {
         },
       ]);
       assert.equal(received.body.model, input.model);
-      assert.equal(JSON.stringify(answer.debug).includes(image.dataUrl), false);
-      assert.match(answer.debug.events[0].messages[0].content, /图片数据已省略/);
+      const debug = await (await debugRequest(requestId)).json();
+      assert.equal(JSON.stringify(debug).includes(image.dataUrl), false);
+      assert.match(debug.events[0].messages[0].content, /图片数据已省略/);
       // Exercise a payload above the old 256 KB chat parser limit.
       const largeImage = {
         ...image,
@@ -1036,20 +1050,23 @@ test('chat configuration ownership and model proxy', async (t) => {
   );
   await t.test('failed model requests retain debug history and original error status', async () => {
     upstreamStatus = 401;
+    const requestId = randomUUID();
     const response = await chat('/completions', 'POST', {
       modelId: first.id,
       messages: [{ role: 'user', content: '检查失败记录' }],
-      debug: true,
+      requestId,
     });
     assert.equal(response.status, 502);
     const body = await response.json();
     assert.match(body.message, /鉴权失败/);
-    assert.equal(body.debug.status, 'error');
+    assert.equal('debug' in body, false);
+    const debug = await (await debugRequest(requestId)).json();
+    assert.equal(debug.status, 'error');
     assert.deepEqual(
-      body.debug.events.map((event) => event.kind),
+      debug.events.map((event) => event.kind),
       ['model_request', 'error'],
     );
-    assert.equal(body.debug.events[0].messages[0].content, '检查失败记录');
+    assert.equal(debug.events[0].messages[0].content, '检查失败记录');
     assert.equal(JSON.stringify(body).includes('sk-replaced'), false);
     upstreamStatus = 200;
   });

@@ -11,7 +11,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
-import { chatContract, ChatCompletionSchema, ChatDebugTraceSchema } from '@repo/contracts';
+import { chatContract, ChatCompletionSchema } from '@repo/contracts';
 import type { ChatStreamEvent } from '@repo/contracts';
 import { TsRest, TsRestHandler, tsRestHandler } from '@ts-rest/nest';
 import type { Response } from 'express';
@@ -69,18 +69,11 @@ export class ChatController {
       if (controller.signal.aborted) return;
       if (!response.headersSent) throw error;
       const status = error instanceof HttpException ? error.getStatus() : 500;
-      const detail = error instanceof HttpException ? error.getResponse() : undefined;
-      const debug = ChatDebugTraceSchema.safeParse(
-        typeof detail === 'object' && detail !== null && 'debug' in detail
-          ? detail.debug
-          : undefined,
-      );
       emit({
         type: 'error',
         status,
         message: error instanceof HttpException ? error.message : '服务暂时不可用，请稍后重试',
         timing: progress.finish(),
-        ...(debug.success ? { debug: debug.data } : {}),
       });
     } finally {
       response.off('close', disconnect);

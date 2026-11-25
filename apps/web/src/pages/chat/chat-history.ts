@@ -1,6 +1,7 @@
 import { CHAT_IMAGES_MAX_BYTES, chatImageBytes } from '@repo/contracts';
 import type { ChatCompletionResponse, ChatHistoryEntry, ChatMessage } from '@repo/contracts';
 import type { DisplayTiming } from '../../components/chat/ChatTimings';
+import { isHistoryRounds } from './chat-settings.ts';
 
 export interface HistoryImage {
   historyId: string;
@@ -70,7 +71,9 @@ export function contextMessages(
   messages: DisplayMessage[],
   conversationId: string,
   question: ChatMessage,
+  historyRounds: number,
 ) {
+  if (!isHistoryRounds(historyRounds) || historyRounds === 0) return [];
   const eligible = messages.filter(
     (message) => message.conversationId === conversationId && message.historyEligible !== false,
   );
@@ -81,6 +84,7 @@ export function contextMessages(
   );
   const selected: DisplayMessage[] = [];
   for (let index = eligible.length - 1; index > 0; index -= 2) {
+    if (selected.length / 2 >= historyRounds) break;
     const answer = eligible[index]!;
     const query = eligible[index - 1]!;
     if (query.role !== 'user' || answer.role !== 'assistant') break;

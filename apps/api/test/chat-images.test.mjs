@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import { test } from 'node:test';
 import { callModel, toModelMessages } from '../.test-dist/chat/model-api.js';
 import { ChatAgentService } from '../.test-dist/chat/chat-agent.service.js';
-import { ChatTrace } from '../.test-dist/chat/chat-trace.js';
+import { ChatTrace } from '../.test-dist/chat-debug/chat-trace.js';
 
 const { ChatCompletionSchema, ChatImageSchema, CHAT_IMAGE_MAX_BYTES } = createRequire(
   import.meta.url,
@@ -132,7 +132,7 @@ test('agent keeps image parts across tool rounds and only executes requested too
               {
                 id: 'image-search',
                 type: 'function',
-                function: { name: 'web_search', arguments: '{"query":"图中地点"}' },
+                function: { name: 'research', arguments: '{"task":"查证图中地点"}' },
               },
             ],
           }
@@ -140,10 +140,18 @@ test('agent keeps image parts across tool rounds and only executes requested too
   }));
   let calls = 0;
   const agent = new ChatAgentService({
-    execute: async () => {
-      calls++;
-      return { data: { pages: [] }, sources: [] };
-    },
+    tools: () => [
+      {
+        definition: {
+          type: 'function',
+          function: { name: 'research', description: '研究', parameters: {} },
+        },
+        execute: async () => {
+          calls++;
+          return { data: { pages: [] }, sources: [] };
+        },
+      },
+    ],
   });
   const answer = await agent.complete(model, [user], new AbortController().signal);
   assert.equal(answer.content, '结合图片和搜索回答');

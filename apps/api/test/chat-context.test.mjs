@@ -98,7 +98,7 @@ test('tool rounds return only final inference usage and omit earlier usage from 
           {
             id: 'tool-1',
             type: 'function',
-            function: { name: 'web_search', arguments: '{"query":"测试"}' },
+            function: { name: 'research', arguments: '{"task":"查证测试"}' },
           },
         ],
       };
@@ -109,14 +109,30 @@ test('tool rounds return only final inference usage and omit earlier usage from 
     };
   });
   const answer = await new ChatAgentService({
-    execute: async () => ({ data: { pages: [] }, sources: [] }),
+    tools: () => [
+      {
+        definition: {
+          type: 'function',
+          function: { name: 'research', description: '研究', parameters: {} },
+        },
+        execute: async () => ({ data: { findings: [] }, sources: [] }),
+      },
+    ],
   }).complete(model, [{ role: 'user', content: '搜索' }], signal());
   assert.equal(round, 2);
   assert.deepEqual(answer.usage, { inputTokens: 500, outputTokens: 40 });
   reportFinalUsage = false;
   round = 0;
   const missing = await new ChatAgentService({
-    execute: async () => ({ data: {}, sources: [] }),
+    tools: () => [
+      {
+        definition: {
+          type: 'function',
+          function: { name: 'research', description: '研究', parameters: {} },
+        },
+        execute: async () => ({ data: {}, sources: [] }),
+      },
+    ],
   }).complete(model, [{ role: 'user', content: '搜索' }], signal());
   assert.equal(missing.usage, undefined);
 });

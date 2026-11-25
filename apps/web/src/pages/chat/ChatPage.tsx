@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Avatar, Banner, Button, Select, Spin } from '@douyinfe/semi-ui';
 import { Link } from 'react-router';
@@ -15,15 +15,22 @@ import {
 import type { ChatMessage, ChatModel, User } from '../../services/api';
 import Icon from '../../components/common/Icon';
 import ModelSettings from '../../components/chat/ModelSettings';
+import ConversationSettings from '../../components/chat/ConversationSettings';
 import ContextUsage from '../../components/chat/ContextUsage';
-import ChatDebugPanel from '../../components/chat/ChatDebugPanel';
+import DebugBoundary from '../../features/chat-debug/DebugBoundary';
 import ChatImages, { ImagePreviews } from '../../components/chat/ChatImages';
-import type { DebugRun } from '../../components/chat/ChatDebugPanel';
 import { initialOf } from '../../utils/user-format';
 import ChatTimings from '../../components/chat/ChatTimings';
 import ChatMarkdown from '../../components/chat/ChatMarkdown';
 import { contextMessages, historyMessages } from './chat-history';
 import type { DisplayMessage } from './chat-history';
+import { loadChatSettings, saveChatSettings } from './chat-settings';
+
+const ChatDebug =
+  import.meta.env.VITE_CHAT_DEBUG_ENABLED === 'true' ||
+  (import.meta.env.DEV && import.meta.env.VITE_CHAT_DEBUG_ENABLED !== 'false')
+    ? lazy(() => import('../../features/chat-debug/ChatDebug'))
+    : null;
 
 interface Props {
   user: User;
@@ -46,8 +53,8 @@ export default function ChatPage({
   const [loadError, setLoadError] = useState('');
   const [reload, setReload] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [debugOpen, setDebugOpen] = useState(false);
-  const [debugRuns, setDebugRuns] = useState<DebugRun[]>([]);
+  const [conversationSettingsOpen, setConversationSettingsOpen] = useState(false);
+  const [chatSettings, setChatSettings] = useState(() => loadChatSettings(user.id));
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [images, setImages] = useState<ChatImage[]>([]);
@@ -61,7 +68,6 @@ export default function ChatPage({
   const requestRef = useRef<AbortController | null>(null);
   const conversationRef = useRef<string>(crypto.randomUUID());
   const previousHistoryRef = useRef<string | undefined>(undefined);
-  const debugRunRef = useRef<string | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const followRef = useRef(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -103,8 +109,6 @@ export default function ChatPage({
   useEffect(() => {
     const controller = new AbortController();
     historyRequestRef.current = controller;
-    setHistoryInitial(true);
-    setHistoryError('');
     void listChatHistory(null, controller.signal)
       .then((page) => {
         if (controller.signal.aborted) return;
@@ -218,7 +222,12 @@ export default function ChatPage({
       content,
       ...(images.length ? { images } : {}),
     };
-    const context = contextMessages(messages, conversationRef.current, userMessage);
+    const context = contextMessages(
+      messages,
+      conversationRef.current,
+      userMessage,
+      chatSettings.historyRounds,
+    );
     const imageController = new AbortController();
     requestRef.current = imageController;
     setImagesBusy(true);
@@ -261,28 +270,12 @@ export default function ChatPage({
       previousHistoryId: previousHistoryRef.current,
       messages: history,
       webSearch: true,
-      debug: true,
     });
     if (!input.success) {
       setError(input.error.issues[0]?.message ?? '对话过长，请开始新对话');
       return;
     }
     const controller = new AbortController();
-    const debugId = crypto.randomUUID();
-    debugRunRef.current = debugId;
-    setDebugRuns((current) =>
-      [
-        ...current,
-        {
-          id: debugId,
-          modelName: selected.name,
-          prompt: content || `图片提问（${images.length} 张）`,
-          startedAt: new Date().toISOString(),
-          status: 'pending' as const,
-          history,
-        },
-      ].slice(-30),
-    );
     requestRef.current = controller;
     followRef.current = true;
     let currentRound = 1;
@@ -335,13 +328,6 @@ export default function ChatPage({
       const finalTiming = answerRef.current?.timing;
       if (!controller.signal.aborted && requestRef.current === controller) {
         previousHistoryRef.current = answer.historyId;
-        setDebugRuns((current) =>
-          current.map((run) =>
-            run.id === debugId
-              ? { ...run, status: 'success', ...(answer.debug ? { trace: answer.debug } : {}) }
-              : run,
-          ),
-        );
         setMessages((current) => [
           ...current,
           {
@@ -371,18 +357,6 @@ export default function ChatPage({
     } catch (error: unknown) {
       if (!controller.signal.aborted && requestRef.current === controller) {
         retainIncomplete();
-        setDebugRuns((current) =>
-          current.map((run) =>
-            run.id === debugId
-              ? {
-                  ...run,
-                  status: 'error',
-                  error: error instanceof Error ? error.message : '发送失败',
-                  ...(error instanceof ApiError && error.debug ? { trace: error.debug } : {}),
-                }
-              : run,
-          ),
-        );
         if (error instanceof ApiError && error.status === 401) onSessionExpired();
         else {
           setError(error instanceof Error ? error.message : '发送失败，请重试');
@@ -396,7 +370,6 @@ export default function ChatPage({
     } finally {
       if (requestRef.current === controller) {
         requestRef.current = null;
-        debugRunRef.current = null;
         setSending(false);
         setPendingMessage(null);
         setPendingAnswer(null);
@@ -450,15 +423,6 @@ export default function ChatPage({
 
   function stop() {
     retainIncomplete();
-    const debugId = debugRunRef.current;
-    setDebugRuns((current) =>
-      current.map((run) =>
-        run.id === debugId
-          ? { ...run, status: 'cancelled', error: '用户停止生成，未收到完整的服务端调用记录' }
-          : run,
-      ),
-    );
-    debugRunRef.current = null;
     requestRef.current?.abort();
     requestRef.current = null;
     setSending(false);
@@ -509,11 +473,20 @@ export default function ChatPage({
       <main className="relative mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col px-4 sm:px-8">
         <div className="flex shrink-0 items-center justify-end gap-1 py-5">
           <Button
-            icon={<Icon name="debug" />}
-            aria-label="打开调试面板"
-            aria-expanded={debugOpen}
-            onClick={() => setDebugOpen(true)}
+            theme="borderless"
+            icon={<Icon name="chat" />}
+            aria-label="打开会话配置"
+            title="会话配置"
+            aria-expanded={conversationSettingsOpen}
+            onClick={() => setConversationSettingsOpen(true)}
           />
+          {ChatDebug && (
+            <DebugBoundary>
+              <Suspense fallback={null}>
+                <ChatDebug models={models} />
+              </Suspense>
+            </DebugBoundary>
+          )}
           <Button
             theme="borderless"
             icon={<Icon name="settings" />}
@@ -570,9 +543,14 @@ export default function ChatPage({
                   <Button
                     size="small"
                     theme="borderless"
-                    onClick={() =>
-                      historyReady ? void loadOlder() : setHistoryReload((value) => value + 1)
-                    }
+                    onClick={() => {
+                      if (historyReady) void loadOlder();
+                      else {
+                        setHistoryInitial(true);
+                        setHistoryError('');
+                        setHistoryReload((value) => value + 1);
+                      }
+                    }}
                   >
                     重试
                   </Button>
@@ -723,6 +701,16 @@ export default function ChatPage({
           </p>
         </div>
       </main>
+      {conversationSettingsOpen && (
+        <ConversationSettings
+          settings={chatSettings}
+          onClose={() => setConversationSettingsOpen(false)}
+          onSave={(settings) => {
+            setChatSettings(settings);
+            return saveChatSettings(user.id, settings);
+          }}
+        />
+      )}
       <ModelSettings
         models={models}
         visible={settingsOpen}
@@ -743,7 +731,6 @@ export default function ChatPage({
           setModels((current) => current.filter((item) => item.id !== id));
         }}
       />
-      <ChatDebugPanel visible={debugOpen} runs={debugRuns} onClose={() => setDebugOpen(false)} />
     </div>
   );
 }

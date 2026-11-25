@@ -52,7 +52,7 @@ export class ChatProgress implements ModelObserver {
       this.closeThought();
       this.timing.phase = phase;
       if (phase === 'thinking') {
-        if (this.timing.thoughts.length >= 32) throw new Error('模型思考阶段过多');
+        if (this.timing.thoughts.length >= 150) throw new Error('模型思考阶段过多');
         this.timing.thoughts.push({ round: event.round, startMs: now, endMs: null });
       }
       changed = true;
@@ -63,7 +63,9 @@ export class ChatProgress implements ModelObserver {
   }
   modelEnd() {
     this.closeThought();
-    this.timing.phase = 'finishing';
+    this.timing.phase = this.timing.tools.some((tool) => tool.endMs === null)
+      ? 'tool'
+      : 'finishing';
     this.state();
   }
   toolStart(round: number, id: string, name: string) {
@@ -71,17 +73,21 @@ export class ChatProgress implements ModelObserver {
     this.timing.tools.push({ round, id, name, startMs: this.clock() - this.started, endMs: null });
     this.state();
   }
-  toolEnd() {
-    const tool = this.timing.tools.at(-1);
+  toolEnd(id?: string) {
+    const tool = [...this.timing.tools]
+      .reverse()
+      .find((item) => item.endMs === null && (id === undefined || item.id === id));
     if (tool?.endMs === null) tool.endMs = this.clock() - this.started;
-    this.timing.phase = 'finishing';
+    this.timing.phase = this.timing.tools.some((item) => item.endMs === null)
+      ? 'tool'
+      : 'finishing';
     this.state();
   }
   finish(): ChatTiming {
     if (this.timing.phase === 'done') return this.snapshot();
     this.closeThought();
-    const tool = this.timing.tools.at(-1);
-    if (tool?.endMs === null) tool.endMs = this.clock() - this.started;
+    for (const tool of this.timing.tools)
+      if (tool.endMs === null) tool.endMs = this.clock() - this.started;
     this.timing.phase = 'done';
     this.timing.elapsedMs = this.clock() - this.started;
     return this.snapshot();

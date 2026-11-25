@@ -24,7 +24,7 @@ import type { ChatResource } from './chat-storage.service';
 import type { ChatRecording } from './chat-recording';
 import type { ModelTurn } from './model-api';
 import type { ModelDelta } from './chat-progress';
-import type { ToolResult } from './web-tools.service';
+import type { AgentScope, ToolResult } from './agents/agent-types';
 
 function json(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
@@ -206,9 +206,10 @@ export class ChatHistoryService implements OnModuleInit, OnModuleDestroy {
         .object({
           sources: ChatCompletionResponseSchema.shape.sources,
           warning: z.string().optional(),
+          internal: z.boolean().optional(),
         })
         .safeParse(output);
-      if (metadata.success) {
+      if (metadata.success && !metadata.data.internal) {
         if (metadata.data.warning) warnings.add(metadata.data.warning);
         for (const source of metadata.data.sources ?? [])
           if (sources.length < 20 && !sources.some((item) => item.url === source.url))
@@ -246,13 +247,18 @@ export class ChatHistoryService implements OnModuleInit, OnModuleDestroy {
       take: 11,
       include: {
         model: { select: { id: true, name: true } },
-        replies: { orderBy: { round: 'desc' }, take: 1 },
+        replies: { orderBy: { round: 'desc' }, take: 24 },
         toolCalls: { orderBy: { sequence: 'asc' } },
       },
     });
     const items = await Promise.all(
       rows.slice(0, 10).map(async (row) => {
-        const reply = row.replies[0];
+        // A cancelled delegate may be the newest reply; only main replies belong in chat.
+        // Legacy records have no scope and remain visible.
+        const reply = row.replies.find((item) => {
+          const scope = z.object({ agent: z.string().optional() }).safeParse(item.timings);
+          return !scope.success || !scope.data.agent || scope.data.agent === 'main';
+        });
         const timing = ChatTimingSchema.safeParse(row.timings);
         return {
           id: row.id,
@@ -447,6 +453,7 @@ export class ChatJournal implements ChatRecording {
       started: number;
       dirty: boolean;
       firstResponseMs: number | null;
+      scope?: AgentScope | undefined;
     }
   >();
   private readonly tools = new Map<string, number>();
@@ -500,7 +507,7 @@ export class ChatJournal implements ChatRecording {
     });
     return this.queue;
   }
-  async replyStart(round: number) {
+  async replyStart(round: number, scope?: AgentScope) {
     const startedAt = new Date();
     const reply = await this.owner.prisma.chatReply.create({
       data: {
@@ -509,6 +516,9 @@ export class ChatJournal implements ChatRecording {
         sequence: await this.sequence(),
         status: 'RUNNING',
         startedAt,
+        ...(scope
+          ? { timings: { agent: scope.agent, parentToolCallId: scope.parentToolCallId ?? null } }
+          : {}),
       },
     });
     this.replies.set(round, {
@@ -518,6 +528,7 @@ export class ChatJournal implements ChatRecording {
       started: startedAt.getTime(),
       dirty: false,
       firstResponseMs: null,
+      scope,
     });
   }
   delta(event: ModelDelta) {
@@ -534,7 +545,7 @@ export class ChatJournal implements ChatRecording {
       reply.dirty = true;
     }
   }
-  async replyEnd(round: number, turn: ModelTurn) {
+  async replyEnd(round: number, turn: ModelTurn, scope?: AgentScope) {
     await this.flush();
     const reply = this.replies.get(round)!;
     await this.owner.prisma.chatReply.updateMany({
@@ -543,19 +554,25 @@ export class ChatJournal implements ChatRecording {
         content: turn.content ?? null,
         reasoningContent: turn.reasoning_content || turn.reasoning || null,
         finishReason: turn.finishReason ?? null,
-        isFinal: !turn.tool_calls?.length,
+        isFinal: !turn.tool_calls?.length && (!scope || scope.agent === 'main'),
         inputTokens: turn.usage?.inputTokens ?? null,
         outputTokens: turn.usage?.outputTokens ?? null,
         status: 'SUCCEEDED',
         finishedAt: new Date(),
         durationMs: Date.now() - reply.started,
-        timings: { firstResponseMs: reply.firstResponseMs },
+        timings: {
+          firstResponseMs: reply.firstResponseMs,
+          ...(scope
+            ? { agent: scope.agent, parentToolCallId: scope.parentToolCallId ?? null }
+            : {}),
+        },
       },
     });
-    await this.owner.prisma.chatHistory.updateMany({
-      where: { id: this.row.id, status: 'RUNNING' },
-      data: { contextUsedTokens: turn.usage?.inputTokens ?? null },
-    });
+    if (!scope || scope.agent === 'main')
+      await this.owner.prisma.chatHistory.updateMany({
+        where: { id: this.row.id, status: 'RUNNING' },
+        data: { contextUsedTokens: turn.usage?.inputTokens ?? null },
+      });
   }
   async replyError(round: number, error: unknown) {
     await this.flush().catch(() => undefined);
@@ -569,7 +586,12 @@ export class ChatJournal implements ChatRecording {
         status: this.clientSignal.aborted ? 'CANCELLED' : 'FAILED',
         finishedAt: new Date(),
         durationMs: Date.now() - reply.started,
-        timings: { firstResponseMs: reply.firstResponseMs },
+        timings: {
+          firstResponseMs: reply.firstResponseMs,
+          ...(reply.scope
+            ? { agent: reply.scope.agent, parentToolCallId: reply.scope.parentToolCallId ?? null }
+            : {}),
+        },
         error: failure(error, this.clientSignal.aborted),
       },
     });

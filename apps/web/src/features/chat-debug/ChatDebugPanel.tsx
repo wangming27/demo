@@ -1,6 +1,7 @@
-import { useState } from 'react';
-import { SideSheet } from '@douyinfe/semi-ui';
-import type { ChatDebugEvent, ChatDebugTrace, ChatMessage } from '@repo/contracts';
+import { useEffect, useState } from 'react';
+import { Button, SideSheet } from '@douyinfe/semi-ui';
+import { readChatDebug } from './api';
+import type { ChatDebugEvent, ChatDebugTrace, ChatMessage, ChatWebRequest } from '@repo/contracts';
 
 export interface DebugRun {
   id: string;
@@ -9,7 +10,6 @@ export interface DebugRun {
   startedAt: string;
   status: 'pending' | 'success' | 'error' | 'cancelled';
   history: ChatMessage[];
-  trace?: ChatDebugTrace;
   error?: string;
 }
 
@@ -32,6 +32,29 @@ export default function ChatDebugPanel({
 }) {
   const [selectedId, setSelectedId] = useState('');
   const selected = runs.find((run) => run.id === selectedId) ?? runs.at(-1);
+  const [record, setRecord] = useState<{ id: string; trace?: ChatDebugTrace; error?: string }>();
+  const [reload, setReload] = useState(0);
+  const requestId = selected?.id;
+  const status = selected?.status;
+  useEffect(() => {
+    if (!visible || !requestId || status === 'pending') return;
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const trace = await readChatDebug(requestId, controller.signal);
+        if (!controller.signal.aborted) setRecord({ id: requestId, trace });
+      } catch (error) {
+        if (!controller.signal.aborted)
+          setRecord({
+            id: requestId,
+            error: error instanceof Error ? error.message : '调试记录读取失败',
+          });
+      }
+    })();
+    return () => controller.abort();
+  }, [visible, requestId, status, reload]);
+  const trace = record && record.id === requestId ? record.trace : undefined;
+  const loadError = record && record.id === requestId ? record.error : undefined;
   return (
     <SideSheet
       title="Chat 调试"
@@ -43,12 +66,12 @@ export default function ChatDebugPanel({
     >
       <div className="space-y-5">
         <p className="text-xs leading-5 text-muted">
-          记录当前页面最近 30
-          次请求，包含重试和失败。执行中的服务端轮次将在请求结束后显示，刷新页面后清空。
+          记录当前页面最近 30 次请求，包含重试和失败。调试记录独立读取，服务端最多保留 30
+          分钟，刷新页面后清空。
         </p>
-        {runs.length === 0 ? (
+        {!runs.length ? (
           <p className="rounded-xl border border-line bg-canvas p-5 text-sm text-muted">
-            暂无调用记录，发送一条消息后可查看用户、模型和工具之间的调用过程。
+            暂无调用记录，发送一条消息后可查看调用过程。
           </p>
         ) : (
           <>
@@ -74,30 +97,34 @@ export default function ChatDebugPanel({
                   <p className="font-medium">
                     {selected.modelName} · {statuses[selected.status]}
                   </p>
-                  <p className="break-all text-muted">
-                    请求 ID：{selected.trace?.requestId ?? selected.id}
-                  </p>
-                  {selected.trace && (
+                  <p className="break-all text-muted">请求 ID：{selected.id}</p>
+                  {trace && (
                     <>
                       <p className="text-muted">
-                        模型：{selected.trace.model.model} · 总耗时 {selected.trace.durationMs} ms ·
-                        模型轮次{' '}
-                        {
-                          selected.trace.events.filter((event) => event.kind === 'model_request')
-                            .length
-                        }{' '}
-                        · 工具调用{' '}
-                        {selected.trace.events.filter((event) => event.kind === 'tool').length}
+                        模型：{trace.model.model} · 总耗时 {trace.durationMs} ms · 模型轮次{' '}
+                        {trace.events.filter((event) => event.kind === 'model_request').length} ·
+                        工具调用 {trace.events.filter((event) => event.kind === 'tool').length}
                       </p>
-                      <p className="break-all text-muted">
-                        API 地址：{selected.trace.model.baseUrl}
-                      </p>
+                      <p className="break-all text-muted">API 地址：{trace.model.baseUrl}</p>
                     </>
                   )}
                   {selected.error && <p className="break-words text-amber-700">{selected.error}</p>}
+                  {loadError && (
+                    <p role="status" className="text-amber-700">
+                      {loadError}
+                    </p>
+                  )}
+                  {trace?.truncated && (
+                    <p className="text-amber-700">调试记录已达到采集上限，部分内容已省略。</p>
+                  )}
+                  {selected.status !== 'pending' && (
+                    <Button size="small" onClick={() => setReload((value) => value + 1)}>
+                      重新读取调试记录
+                    </Button>
+                  )}
                 </div>
-                {selected.trace ? (
-                  selected.trace.events.map((event, index) => (
+                {trace ? (
+                  trace.events.map((event, index) => (
                     <DebugEvent key={index} event={event} index={index} />
                   ))
                 ) : (
@@ -107,21 +134,14 @@ export default function ChatDebugPanel({
                       <Detail
                         key={index}
                         title={`${index + 1}. ${roles[message.role]}`}
-                        content={[
-                          message.content,
-                          ...(message.images ?? []).map(
-                            (image) => `[图片：${image.name}；图片数据已省略]`,
-                          ),
-                        ]
-                          .filter(Boolean)
-                          .join('\n')}
+                        content={message.content}
                         open
                       />
                     ))}
                     <p className="text-xs text-muted">
                       {selected.status === 'pending'
-                        ? '等待服务端返回实际模型消息和工具调用记录…'
-                        : '本次请求未收到服务端调用记录，以上为浏览器提交的消息。'}
+                        ? '请求结束后可独立读取服务端调用记录…'
+                        : '调试记录独立读取，以上为浏览器提交的消息。'}
                     </p>
                   </div>
                 )}
@@ -147,7 +167,9 @@ function DebugEvent({ event, index }: { event: ChatDebugEvent; index: number }) 
         {index + 1}. {title}
       </h3>
       <p className="mt-1 text-xs text-muted">
-        第 {event.round} 轮 · {new Date(event.startedAt).toLocaleTimeString()}
+        {event.agent ? `${event.agent} · ` : ''}第 {event.round} 轮 ·
+        {new Date(event.startedAt).toLocaleTimeString()}
+        {event.parentToolCallId ? ` · 委派 ${event.parentToolCallId}` : ''}
         {event.kind !== 'model_request' && ` · ${event.durationMs} ms`}
       </p>
       {event.truncated && <p className="mt-2 text-xs text-amber-700">内容过长，部分文本已截断。</p>}
@@ -190,6 +212,14 @@ function DebugEvent({ event, index }: { event: ChatDebugEvent; index: number }) 
             <p className="break-all text-sm font-medium">{event.name}</p>
             <p className="break-all text-xs text-muted">tool_call_id：{event.toolCallId}</p>
             <Detail title="工具参数" content={event.arguments} open />
+            {event.cacheHit && (
+              <p className="text-xs text-muted">
+                命中缓存，本次未发送网页请求；下方为首次请求的记录。
+              </p>
+            )}
+            {event.webRequests?.map((request, requestIndex) => (
+              <WebRequest key={requestIndex} request={request} index={requestIndex} />
+            ))}
             <Detail title="工具返回结果（传回模型的内容）" content={event.result} open />
             {event.warning && <p className="text-xs text-amber-700">{event.warning}</p>}
           </>
@@ -199,6 +229,36 @@ function DebugEvent({ event, index }: { event: ChatDebugEvent; index: number }) 
         )}
       </div>
     </section>
+  );
+}
+
+function WebRequest({ request, index }: { request: ChatWebRequest; index: number }) {
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'error'>('idle');
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(request.curl);
+      setCopyStatus('copied');
+    } catch {
+      setCopyStatus('error');
+    }
+  }
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-muted">
+          网页请求 {index + 1} · {new Date(request.requestedAt).toLocaleTimeString()}
+        </p>
+        <Button size="small" onClick={() => void copy()}>
+          {copyStatus === 'copied' ? '已复制 cURL' : '复制 cURL'}
+        </Button>
+      </div>
+      <Detail title="网页请求 cURL" content={request.curl} />
+      {copyStatus === 'error' && (
+        <p role="status" className="text-xs text-amber-700">
+          复制失败，请展开 cURL 后手动复制。
+        </p>
+      )}
+    </div>
   );
 }
 

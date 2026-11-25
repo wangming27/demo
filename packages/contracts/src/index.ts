@@ -164,7 +164,12 @@ export const chatContract = c.router(
   },
   { pathPrefix: '/api', commonResponses, strictStatusCodes: true },
 );
-export const apiContract = c.router({
+export const apiContract: {
+  auth: typeof authContract;
+  users: typeof usersContract;
+  health: typeof healthContract;
+  chat: typeof chatContract;
+} = c.router({
   auth: authContract,
   users: usersContract,
   health: healthContract,
